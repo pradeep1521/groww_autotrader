@@ -51,10 +51,10 @@ with st.sidebar:
 
     st.divider()
     st.caption("Pages")
-    st.page_link("app.py",                             label="📊 Dashboard")
-    st.page_link("pages/1_⚙️_Strategies.py",          label="⚙️ Strategy Manager")
-    st.page_link("pages/2_📋_History.py",              label="📋 Trade History")
-    st.page_link("pages/3_🔑_Broker_Connect.py",       label="🔑 Broker Connect")
+    st.page_link("app.py",                            label="📊 Dashboard")
+    st.page_link("pages/1_⚙️_Strategies.py",         label="⚙️ Options Chain · MTF · Intraday")
+    st.page_link("pages/2_📋_History.py",             label="📋 Trade History")
+    st.page_link("pages/3_🔑_Broker_Connect.py",      label="🔑 Broker Connect")
 
 # ── Header ─────────────────────────────────────────────────────────────────────
 st.title("📊 Live Dashboard")
@@ -118,22 +118,58 @@ bot.max_daily_loss = -abs(new_limit)
 
 st.divider()
 
-# ── Market snapshot ────────────────────────────────────────────────────────────
+# ── Market + Options Chain snapshot ────────────────────────────────────────────
 st.subheader("📡 Market Snapshot")
-_syms = ["NIFTY", "BANKNIFTY", "FINNIFTY", "VIX"]
-_cols = st.columns(4)
-for col, sym in zip(_cols, _syms):
+
+_syms = ["NIFTY", "BANKNIFTY", "VIX"]
+_cols = st.columns(len(_syms) + 2)   # +2 for PCR and MaxPain
+
+for col, sym in zip(_cols[:len(_syms)], _syms):
     q   = feed.get_price(sym) or {}
-    px  = q.get("price", "—")
+    px  = q.get("price", 0)
     chg = q.get("change_pct", 0)
     clr = "#065f46" if chg >= 0 else "#dc2626"
-    col.markdown(
-        f"<div class='kpi'><div class='kpi-lbl'>{sym}</div>"
-        f"<div style='font-weight:700;font-size:1.1rem'>₹{px:,.2f}" if isinstance(px, float)
-        else f"<div style='font-weight:700;font-size:1.1rem'>—"
-        f"</div><div style='color:{clr};font-size:.82rem;font-weight:600'>{chg:+.2f}%</div></div>",
+    if isinstance(px, float) and px > 0:
+        col.markdown(
+            f"<div class='kpi'><div class='kpi-lbl'>{sym}</div>"
+            f"<div style='font-weight:700;font-size:1.1rem'>₹{px:,.2f}</div>"
+            f"<div style='color:{clr};font-size:.82rem;font-weight:600'>{chg:+.2f}%</div></div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        col.markdown(
+            f"<div class='kpi'><div class='kpi-lbl'>{sym}</div>"
+            f"<div style='font-weight:700;font-size:1.1rem'>—</div></div>",
+            unsafe_allow_html=True,
+        )
+
+# PCR + MaxPain from options chain (cached — won't block)
+try:
+    from engine.options_chain import max_pain, parse_chain, pcr
+    _df  = parse_chain("NIFTY")
+    _pcr = pcr(_df) if not _df.empty else None
+    _mp  = max_pain(_df) if not _df.empty else None
+    pcr_clr = "#065f46" if _pcr and _pcr > 1 else "#dc2626" if _pcr and _pcr < 0.8 else "#374151"
+    _cols[3].markdown(
+        f"<div class='kpi'><div class='kpi-lbl'>NIFTY PCR</div>"
+        f"<div class='kpi-num' style='color:{pcr_clr}'>"
+        f"{_pcr:.3f}" if _pcr else "—"
+        f"</div><div style='font-size:.72rem;color:#6b7280'>"
+        f"{'Bullish' if _pcr and _pcr>1.2 else 'Bearish' if _pcr and _pcr<0.8 else 'Neutral'}"
+        f"</div></div>",
         unsafe_allow_html=True,
     )
+    _cols[4].markdown(
+        f"<div class='kpi'><div class='kpi-lbl'>Max Pain</div>"
+        f"<div class='kpi-num'>{_mp:,}" if _mp else "<div class='kpi-num'>—"
+        f"</div></div>",
+        unsafe_allow_html=True,
+    )
+except Exception:
+    _cols[3].markdown("<div class='kpi'><div class='kpi-lbl'>NIFTY PCR</div>"
+                      "<div class='kpi-num'>—</div></div>", unsafe_allow_html=True)
+    _cols[4].markdown("<div class='kpi'><div class='kpi-lbl'>Max Pain</div>"
+                      "<div class='kpi-num'>—</div></div>", unsafe_allow_html=True)
 
 st.divider()
 

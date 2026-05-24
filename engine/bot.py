@@ -1,21 +1,20 @@
 """
 AutoTrader Bot Engine
 =====================
-Runs configurable strategies in a daemon thread, placing orders via Groww API
+Runs strategies in a daemon thread, placing orders via Groww API
 (or paper mode when not connected / paper=True).
 
 Strategies
 ----------
-  Short Straddle  — Sell ATM CE + PE, exit at premium% profit/loss or time
-  Iron Condor     — Sell ATM±wing, buy OTM protection; exit at target or time
-  ORB Breakout    — Trade 15-min opening range breakout; SL at range midpoint
-  EMA Crossover   — Golden/death cross of EMA(fast) vs EMA(slow)
+  Options Chain — PCR / MaxPain / OIBuildup signal → BUY CE, BUY PE, or SELL STRADDLE
+  MTF           — Margin Trading Facility: swing trade stocks with EMA cross / RSI bounce
+  Intraday      — MIS cash trades: VWAP bounce, ORB breakout, or Momentum (EMA+RSI)
 
 Usage
 -----
     from engine.bot import bot
     bot.start()
-    sid = bot.add_run("Short Straddle", symbol="NIFTY", lots=1, paper=True)
+    sid = bot.add_run("Options Chain", symbol="NIFTY", lots=1, paper=True)
     bot.stop()
 """
 
@@ -36,16 +35,42 @@ from engine.pricer import RISK_FREE_RATE, black_scholes
 LOT_SIZES  = {"NIFTY": 75, "BANKNIFTY": 30, "FINNIFTY": 40, "MIDCAPNIFTY": 50}
 STEP_SIZES = {"NIFTY": 50, "BANKNIFTY": 100, "FINNIFTY": 50, "MIDCAPNIFTY": 25}
 
-STRATEGY_NAMES = ["Short Straddle", "Iron Condor", "ORB Breakout", "EMA Crossover"]
+STRATEGY_NAMES = ["Options Chain", "MTF", "Intraday"]
 
 STRATEGY_DEFAULTS: dict[str, dict] = {
-    "Short Straddle": {"entry_time": "09:20", "exit_time": "15:15",
-                       "target_pct": 50, "sl_pct": 100},
-    "Iron Condor":    {"entry_time": "09:20", "exit_time": "15:15",
-                       "wing_width": 2, "target_pct": 50},
-    "ORB Breakout":   {"orb_minutes": 15, "exit_time": "15:15",
-                       "sl_buffer_pct": 0.3, "target_mult": 2.0},
-    "EMA Crossover":  {"fast_ema": 9, "slow_ema": 21, "exit_time": "15:15"},
+    "Options Chain": {
+        "symbol":     "NIFTY",
+        "mode":       "PCR",          # PCR | MaxPain | OIBuildup
+        "direction":  "AUTO",         # AUTO | BUY_CE | BUY_PE | SELL_STRADDLE
+        "lots":       1,
+        "entry_time": "09:30",
+        "exit_time":  "15:00",
+        "target_pct": 50,
+        "sl_pct":     30,
+    },
+    "MTF": {
+        "symbol":     "RELIANCE",
+        "signal":     "EMA Cross",    # EMA Cross | RSI Bounce
+        "fast_ema":   9,
+        "slow_ema":   21,
+        "rsi_level":  35,
+        "qty":        10,
+        "target_pct": 2.0,
+        "sl_pct":     1.0,
+        "max_days":   3,
+    },
+    "Intraday": {
+        "symbol":     "RELIANCE",
+        "mode":       "VWAP",         # VWAP | ORB | Momentum
+        "qty":        50,
+        "entry_time": "09:20",
+        "exit_time":  "15:10",
+        "target_pct": 0.8,
+        "sl_pct":     0.4,
+        "orb_minutes": 15,
+        "fast_ema":   9,
+        "slow_ema":   21,
+    },
 }
 
 
@@ -185,175 +210,208 @@ class AutoTrader:
                 run.emit(f"❌ Error: {exc}")
 
     def _dispatch(self, run: StrategyRun, now: datetime) -> None:
-        if   run.name == "Short Straddle": self._short_straddle(run, now)
-        elif run.name == "Iron Condor":    self._iron_condor(run, now)
-        elif run.name == "ORB Breakout":   self._orb(run, now)
-        elif run.name == "EMA Crossover":  self._ema_cross(run, now)
+        if   run.name == "Options Chain": self._options_chain(run, now)
+        elif run.name == "MTF":           self._mtf(run, now)
+        elif run.name == "Intraday":      self._intraday(run, now)
 
-    # ── Strategy: Short Straddle ───────────────────────────────────────────────
+    # ── Strategy 1: Options Chain ──────────────────────────────────────────────
 
-    def _short_straddle(self, run: StrategyRun, now: datetime) -> None:
-        p   = run.params
-        pe  = _past(p.get("entry_time", "09:20"), now)
-        px  = _past(p.get("exit_time",  "15:15"), now)
-        tgt = float(p.get("target_pct", 50))  / 100
-        sl  = float(p.get("sl_pct",    100))  / 100
+    def _options_chain(self, run: StrategyRun, now: datetime) -> None:
+        from engine.options_chain import get_expiries, get_signal, parse_chain
 
-        if run.state == "WAITING" and pe and not px:
-            sp = feed.spot(run.symbol)
-            if sp <= 0:
-                run.emit("⚠️ No spot price — waiting"); return
+        p         = run.params
+        tgt       = float(p.get("target_pct", 50)) / 100
+        sl        = float(p.get("sl_pct",     30))  / 100
+        at_exit   = _past(p.get("exit_time", "15:00"), now)
+        at_entry  = _past(p.get("entry_time", "09:30"), now)
 
-            step   = STEP_SIZES.get(run.symbol, 50)
-            K      = int(round(sp / step) * step)
-            expiry = _next_thursday()
-            T      = max(0.001, (expiry - date.today()).days / 365)
-            iv     = max(feed.spot("VIX") or 15, 5) / 100
-            qty    = run.lots * LOT_SIZES.get(run.symbol, 75)
-
-            ce_px  = max(round(black_scholes(sp, K, T, iv, RISK_FREE_RATE, "CE"), 2), 0.5)
-            pe_px  = max(round(black_scholes(sp, K, T, iv, RISK_FREE_RATE, "PE"), 2), 0.5)
-            ce_sym = _opt_sym(run.symbol, expiry, K, "CE")
-            pe_sym = _opt_sym(run.symbol, expiry, K, "PE")
-
-            self._place(run, ce_sym, "SELL", qty, ce_px, "CE", K)
-            self._place(run, pe_sym, "SELL", qty, pe_px, "PE", K)
-
-            total_cr = (ce_px + pe_px) * qty
-            run.entry_data = {"K": K, "total_credit": total_cr}
-            run.state = "ACTIVE"
-            run.emit(f"✅ ENTERED spot={sp:.0f} K={K} CE=₹{ce_px:.2f} PE=₹{pe_px:.2f} "
-                     f"credit=₹{total_cr:,.0f}")
-
-        elif run.state == "ACTIVE":
-            if px:
-                self._exit(run, "⏱ Time exit"); return
-            self._refresh_pnl(run)
-            cr = run.entry_data.get("total_credit", 1)
-            if run.pnl >= cr * tgt:
-                self._exit(run, f"🎯 Target {tgt*100:.0f}% hit")
-            elif run.pnl <= -cr * sl:
-                self._exit(run, f"🛑 SL {sl*100:.0f}% hit")
-
-    # ── Strategy: Iron Condor ──────────────────────────────────────────────────
-
-    def _iron_condor(self, run: StrategyRun, now: datetime) -> None:
-        p   = run.params
-        pe  = _past(p.get("entry_time", "09:20"), now)
-        px  = _past(p.get("exit_time",  "15:15"), now)
-        w   = int(p.get("wing_width", 2))
-        tgt = float(p.get("target_pct", 50)) / 100
-
-        if run.state == "WAITING" and pe and not px:
-            sp = feed.spot(run.symbol)
-            if sp <= 0:
-                run.emit("⚠️ No spot — waiting"); return
-
-            step   = STEP_SIZES.get(run.symbol, 50)
-            K      = int(round(sp / step) * step)
-            expiry = _next_thursday()
-            T      = max(0.001, (expiry - date.today()).days / 365)
-            iv     = max(feed.spot("VIX") or 15, 5) / 100
-            qty    = run.lots * LOT_SIZES.get(run.symbol, 75)
-
-            legs = [
-                (K + w * step,     "CE", "SELL"),
-                (K + w * 2 * step, "CE", "BUY"),
-                (K - w * step,     "PE", "SELL"),
-                (K - w * 2 * step, "PE", "BUY"),
-            ]
-            net = 0.0
-            for strike, ot, side in legs:
-                px_ = max(round(black_scholes(sp, strike, T, iv, RISK_FREE_RATE, ot), 2), 0.1)
-                sym = _opt_sym(run.symbol, expiry, strike, ot)
-                self._place(run, sym, side, qty, px_, ot, strike)
-                net += px_ if side == "SELL" else -px_
-                run.emit(f"  {side} {sym} @ ₹{px_:.2f}")
-
-            run.entry_data = {"K": K, "net_credit": net, "total_credit": net * qty}
-            run.state = "ACTIVE"
-            run.emit(f"✅ Iron Condor | K={K} | net ₹{net:.2f} | max profit ₹{net*qty:,.0f}")
-
-        elif run.state == "ACTIVE":
-            if px:
-                self._exit(run, "⏱ Time exit"); return
-            self._refresh_pnl(run)
-            cr = run.entry_data.get("total_credit", 1)
-            if run.pnl >= cr * tgt:
-                self._exit(run, f"🎯 Target {tgt*100:.0f}%")
-
-    # ── Strategy: ORB Breakout ─────────────────────────────────────────────────
-
-    def _orb(self, run: StrategyRun, now: datetime) -> None:
-        p       = run.params
-        mins    = int(p.get("orb_minutes", 15))
-        px      = _past(p.get("exit_time", "15:15"), now)
-        sl_buf  = float(p.get("sl_buffer_pct", 0.3)) / 100
-        tgt_m   = float(p.get("target_mult", 2.0))
-
-        open_   = now.replace(hour=9,  minute=15, second=0, microsecond=0)
-        end_orb = now.replace(hour=9,  minute=15 + mins, second=0, microsecond=0)
-
-        sp  = feed.spot(run.symbol)
+        sp = feed.spot(run.symbol)
         if sp <= 0:
-            return
-        IndicatorEngine.for_symbol(run.symbol).push(sp)
+            run.emit("⚠️ No spot price — waiting"); return
 
-        # Build range
-        if open_ <= now < end_orb:
-            run.params["_h"] = max(run.params.get("_h", 0), sp)
-            run.params["_l"] = min(run.params.get("_l", 9e9), sp)
-            run.emit(f"ORB forming H={run.params['_h']:.0f} L={run.params['_l']:.0f}")
-            return
+        if run.state == "WAITING":
+            if not at_entry:
+                return
+            if at_exit:
+                run.state = "DONE"; run.emit("Market closed before entry"); return
 
-        orb_h = run.params.get("_h", 0)
-        orb_l = run.params.get("_l", 9e9)
-        if orb_h <= 0 or orb_l >= 9e9:
-            return
+            direction = p.get("direction", "AUTO")
+            if direction == "AUTO":
+                df  = parse_chain(run.symbol)
+                sig = get_signal(df, sp, mode=p.get("mode", "PCR"))
+                direction = sig["direction"]
+                run.emit(f"Signal: {sig['reason']}")
+            else:
+                sig = {"atm_strike": 0, "pcr_val": 1.0, "max_pain_k": 0}
 
-        rng = orb_h - orb_l
-        qty = run.lots * LOT_SIZES.get(run.symbol, 75)
+            if direction == "WAIT":
+                run.emit("No trade signal this tick — will retry"); return
 
-        if run.state == "WAITING" and now >= end_orb:
-            if sp > orb_h * (1 + sl_buf):
-                sl_  = orb_h - rng * 0.5
-                tgt_ = sp + rng * tgt_m
-                self._place(run, run.symbol, "BUY", qty, sp, "EQUITY", 0)
-                run.legs[-1].update({"sl": sl_, "tgt": tgt_})
+            step   = STEP_SIZES.get(run.symbol, 50)
+            atm    = sig.get("atm_strike") or int(round(sp / step) * step)
+            expiry = _next_thursday()
+            T      = max(0.001, (expiry - date.today()).days / 365)
+            iv     = max(feed.spot("VIX") or 15, 5) / 100
+            qty    = int(p.get("lots", 1)) * LOT_SIZES.get(run.symbol, 75)
+
+            if direction == "BUY_CE":
+                px_  = max(round(black_scholes(sp, atm, T, iv, RISK_FREE_RATE, "CE"), 2), 0.5)
+                sym  = _opt_sym(run.symbol, expiry, atm, "CE")
+                self._place(run, sym, "BUY", qty, px_, "CE", atm)
+                run.entry_data = {"direction": "BUY_CE", "entry_premium": px_, "qty": qty}
                 run.state = "ACTIVE"
-                run.emit(f"📈 BUY @ ₹{sp:.2f} | SL ₹{sl_:.2f} | Target ₹{tgt_:.2f}")
+                run.emit(f"📈 BUY CE {sym} @ ₹{px_:.2f} | IV={iv*100:.0f}% ATM={atm}")
 
-            elif sp < orb_l * (1 - sl_buf):
-                sl_  = orb_l + rng * 0.5
-                tgt_ = sp - rng * tgt_m
-                self._place(run, run.symbol, "SELL", qty, sp, "EQUITY", 0)
-                run.legs[-1].update({"sl": sl_, "tgt": tgt_})
+            elif direction == "BUY_PE":
+                px_  = max(round(black_scholes(sp, atm, T, iv, RISK_FREE_RATE, "PE"), 2), 0.5)
+                sym  = _opt_sym(run.symbol, expiry, atm, "PE")
+                self._place(run, sym, "BUY", qty, px_, "PE", atm)
+                run.entry_data = {"direction": "BUY_PE", "entry_premium": px_, "qty": qty}
                 run.state = "ACTIVE"
-                run.emit(f"📉 SELL @ ₹{sp:.2f} | SL ₹{sl_:.2f} | Target ₹{tgt_:.2f}")
+                run.emit(f"📉 BUY PE {sym} @ ₹{px_:.2f} | IV={iv*100:.0f}% ATM={atm}")
+
+            elif direction == "SELL_STRADDLE":
+                ce_px = max(round(black_scholes(sp, atm, T, iv, RISK_FREE_RATE, "CE"), 2), 0.5)
+                pe_px = max(round(black_scholes(sp, atm, T, iv, RISK_FREE_RATE, "PE"), 2), 0.5)
+                self._place(run, _opt_sym(run.symbol, expiry, atm, "CE"), "SELL", qty, ce_px, "CE", atm)
+                self._place(run, _opt_sym(run.symbol, expiry, atm, "PE"), "SELL", qty, pe_px, "PE", atm)
+                total_cr = (ce_px + pe_px) * qty
+                run.entry_data = {"direction": "SELL_STRADDLE", "total_credit": total_cr, "qty": qty}
+                run.state = "ACTIVE"
+                run.emit(f"⚡ SELL STRADDLE ATM={atm} CE₹{ce_px:.2f}+PE₹{pe_px:.2f} credit=₹{total_cr:,.0f}")
 
         elif run.state == "ACTIVE":
-            if px:
+            if at_exit:
                 self._exit(run, "⏱ Time exit"); return
-            leg = run.legs[0] if run.legs else None
-            if not leg:
+            self._refresh_pnl(run)
+            ed  = run.entry_data
+            qty = ed.get("qty", 1)
+            d   = ed.get("direction", "")
+
+            if "BUY" in d:
+                ep  = ed.get("entry_premium", 1)
+                if run.pnl >= ep * qty * tgt:
+                    self._exit(run, f"🎯 Target {tgt*100:.0f}% of premium")
+                elif run.pnl <= -(ep * qty * sl):
+                    self._exit(run, f"🛑 SL {sl*100:.0f}% of premium")
+            else:  # SELL_STRADDLE
+                cr = ed.get("total_credit", 1)
+                if run.pnl >= cr * tgt:
+                    self._exit(run, f"🎯 Target {tgt*100:.0f}% of credit")
+                elif run.pnl <= -(cr * sl):
+                    self._exit(run, f"🛑 SL {sl*100:.0f}% of credit")
+
+    # ── Strategy 2: MTF (Margin Trading Facility) ─────────────────────────────
+
+    def _mtf(self, run: StrategyRun, now: datetime) -> None:
+        """
+        Swing trade using Groww's Margin Trading Facility (leveraged equity).
+        Not intraday — can hold for up to max_days.
+        """
+        p       = run.params
+        sig_m   = p.get("signal", "EMA Cross")
+        fast_n  = int(p.get("fast_ema", 9))
+        slow_n  = int(p.get("slow_ema", 21))
+        rsi_lvl = float(p.get("rsi_level", 35))
+        qty     = int(p.get("qty", 10))
+        tgt_pct = float(p.get("target_pct", 2.0)) / 100
+        sl_pct  = float(p.get("sl_pct", 1.0))  / 100
+        max_d   = int(p.get("max_days", 3))
+
+        sp = feed.spot(run.symbol)
+        if sp <= 0:
+            run.emit("⚠️ No price data"); return
+
+        ind = IndicatorEngine.for_symbol(run.symbol)
+        ind.push(sp)
+        fast = ind.ema(fast_n)
+        slow = ind.ema(slow_n)
+        rsi  = ind.rsi(14)
+
+        if run.state == "WAITING":
+            if fast is None or slow is None:
+                run.emit(f"Building indicators ({len(ind)}/{slow_n})…"); return
+
+            pf = p.get("_pf")
+            ps = p.get("_ps")
+            p["_pf"], p["_ps"] = fast, slow
+
+            if pf is None:
                 return
-            sl_, tgt_ = leg.get("sl", 0), leg.get("tgt", 0)
-            if leg["side"] == "BUY":
-                run.pnl = (sp - leg["entry_px"]) * qty
-                if sp <= sl_:         self._exit(run, f"🛑 SL ₹{sl_:.0f}")
-                elif tgt_ and sp >= tgt_: self._exit(run, f"🎯 Target ₹{tgt_:.0f}")
+
+            triggered = False
+            if sig_m == "EMA Cross":
+                was_bull = pf > ps
+                is_bull  = fast > slow
+                if not was_bull and is_bull:
+                    triggered = True
+                    run.entry_data["ema_dir"] = "LONG"
+                    run.emit(f"📈 Golden cross EMA{fast_n}>{fast_n}: BUY")
+                elif was_bull and not is_bull:
+                    triggered = True
+                    run.entry_data["ema_dir"] = "SHORT"
+                    run.emit(f"📉 Death cross EMA{fast_n}<{slow_n}: SELL")
+
+            elif sig_m == "RSI Bounce":
+                p_rsi = p.get("_prev_rsi")
+                p["_prev_rsi"] = rsi
+                if p_rsi is not None and rsi is not None:
+                    if p_rsi < rsi_lvl and rsi >= rsi_lvl and fast > slow:
+                        triggered = True
+                        run.entry_data["ema_dir"] = "LONG"
+                        run.emit(f"📈 RSI bounce {p_rsi:.1f}→{rsi:.1f} (EMA bullish): BUY")
+                    elif p_rsi > (100 - rsi_lvl) and rsi <= (100 - rsi_lvl) and fast < slow:
+                        triggered = True
+                        run.entry_data["ema_dir"] = "SHORT"
+                        run.emit(f"📉 RSI reversal {p_rsi:.1f}→{rsi:.1f} (EMA bearish): SELL")
+
+            if triggered:
+                side = "BUY" if run.entry_data.get("ema_dir") == "LONG" else "SELL"
+                self._place(run, run.symbol, side, qty, sp, "MTF_EQUITY", 0, product="MTF")
+                run.entry_data.update({
+                    "entry_px": sp, "qty": qty, "entry_date": now.date().isoformat(),
+                })
+                run.state = "ACTIVE"
+                run.emit(f"✅ MTF {side} {qty}×{run.symbol} @ ₹{sp:.2f} | target ₹{sp*(1+tgt_pct):.2f}")
+
+        elif run.state == "ACTIVE":
+            ed        = run.entry_data
+            entry_px  = ed.get("entry_px", sp)
+            ema_dir   = ed.get("ema_dir", "LONG")
+            entry_d   = ed.get("entry_date", now.date().isoformat())
+            held_days = (now.date() - date.fromisoformat(entry_d)).days
+
+            if ema_dir == "LONG":
+                run.pnl = (sp - entry_px) * qty
+                sl_px   = entry_px * (1 - sl_pct)
+                tgt_px  = entry_px * (1 + tgt_pct)
+                if sp <= sl_px:
+                    self._exit(run, f"🛑 SL ₹{sl_px:.2f} hit")
+                elif sp >= tgt_px:
+                    self._exit(run, f"🎯 Target ₹{tgt_px:.2f} hit")
+                elif held_days >= max_d:
+                    self._exit(run, f"📅 Max {max_d} days reached")
             else:
-                run.pnl = (leg["entry_px"] - sp) * qty
-                if sp >= sl_:         self._exit(run, f"🛑 SL ₹{sl_:.0f}")
-                elif tgt_ and sp <= tgt_: self._exit(run, f"🎯 Target ₹{tgt_:.0f}")
+                run.pnl = (entry_px - sp) * qty
+                sl_px   = entry_px * (1 + sl_pct)
+                tgt_px  = entry_px * (1 - tgt_pct)
+                if sp >= sl_px:
+                    self._exit(run, f"🛑 SL ₹{sl_px:.2f} hit")
+                elif sp <= tgt_px:
+                    self._exit(run, f"🎯 Target ₹{tgt_px:.2f} hit")
+                elif held_days >= max_d:
+                    self._exit(run, f"📅 Max {max_d} days reached")
 
-    # ── Strategy: EMA Crossover ────────────────────────────────────────────────
+    # ── Strategy 3: Intraday (VWAP / ORB / Momentum) ─────────────────────────
 
-    def _ema_cross(self, run: StrategyRun, now: datetime) -> None:
-        p      = run.params
-        fast_n = int(p.get("fast_ema", 9))
-        slow_n = int(p.get("slow_ema", 21))
-        px     = _past(p.get("exit_time", "15:15"), now)
+    def _intraday(self, run: StrategyRun, now: datetime) -> None:
+        p        = run.params
+        mode     = p.get("mode", "VWAP")
+        qty      = int(p.get("qty", 50))
+        at_entry = _past(p.get("entry_time", "09:20"), now)
+        at_exit  = _past(p.get("exit_time",  "15:10"), now)
+        tgt_pct  = float(p.get("target_pct", 0.8)) / 100
+        sl_pct   = float(p.get("sl_pct",  0.4))    / 100
 
         sp = feed.spot(run.symbol)
         if sp <= 0:
@@ -361,53 +419,111 @@ class AutoTrader:
 
         ind = IndicatorEngine.for_symbol(run.symbol)
         ind.push(sp)
-        fast, slow = ind.ema(fast_n), ind.ema(slow_n)
 
-        if fast is None or slow is None:
-            run.emit(f"Building EMA ({len(ind)}/{slow_n} bars)…"); return
+        # ── Mandatory time exit ─────────────────────────────────────────────
+        if run.state == "ACTIVE" and at_exit:
+            self._exit(run, "⏱ Intraday auto square-off"); return
 
-        pf_, ps_ = run.params.get("_pf"), run.params.get("_ps")
-        run.params["_pf"], run.params["_ps"] = fast, slow
-
-        qty = run.lots * LOT_SIZES.get(run.symbol, 75)
-
-        if run.state == "ACTIVE" and px:
-            self._exit(run, "⏱ Time exit"); return
-
+        # ── Check P&L on active position ────────────────────────────────────
         if run.state == "ACTIVE":
             leg = run.legs[0] if run.legs else None
             if leg:
                 run.pnl = (sp - leg["entry_px"]) * qty if leg["side"] == "BUY" \
                           else (leg["entry_px"] - sp) * qty
-                if (leg["side"] == "BUY"  and fast < slow) or \
-                   (leg["side"] == "SELL" and fast > slow):
-                    self._exit(run, "↩️ EMA reversal")
-                    run.state = "WAITING"
+                sl_px  = leg["entry_px"] * ((1 - sl_pct)  if leg["side"] == "BUY" else (1 + sl_pct))
+                tgt_px = leg["entry_px"] * ((1 + tgt_pct) if leg["side"] == "BUY" else (1 - tgt_pct))
+                if leg["side"] == "BUY":
+                    if sp <= sl_px:  self._exit(run, f"🛑 SL ₹{sl_px:.2f}"); return
+                    if sp >= tgt_px: self._exit(run, f"🎯 Target ₹{tgt_px:.2f}"); return
+                else:
+                    if sp >= sl_px:  self._exit(run, f"🛑 SL ₹{sl_px:.2f}"); return
+                    if sp <= tgt_px: self._exit(run, f"🎯 Target ₹{tgt_px:.2f}"); return
             return
 
-        if pf_ is None or ps_ is None:
+        if not at_entry or at_exit:
             return
 
-        was_bull, is_bull = pf_ > ps_, fast > slow
-        if not was_bull and is_bull:
-            self._place(run, run.symbol, "BUY", qty, sp, "EQUITY", 0)
-            run.state = "ACTIVE"
-            run.emit(f"📈 Golden cross EMA{fast_n}={fast:.0f}>EMA{slow_n}={slow:.0f} | BUY @ ₹{sp:.2f}")
-        elif was_bull and not is_bull:
-            self._place(run, run.symbol, "SELL", qty, sp, "EQUITY", 0)
-            run.state = "ACTIVE"
-            run.emit(f"📉 Death cross EMA{fast_n}={fast:.0f}<EMA{slow_n}={slow:.0f} | SELL @ ₹{sp:.2f}")
+        # ── VWAP mode ───────────────────────────────────────────────────────
+        if mode == "VWAP":
+            vwap = ind.vwap()
+            rsi  = ind.rsi(14)
+            if vwap is None or rsi is None:
+                run.emit(f"Building VWAP ({len(ind)} ticks)…"); return
+            if sp < vwap * 0.998 and rsi < 45:
+                self._place(run, run.symbol, "BUY", qty, sp, "MIS_EQUITY", 0, product="MIS")
+                run.state = "ACTIVE"
+                run.emit(f"📈 VWAP BUY: price ₹{sp:.2f} < VWAP ₹{vwap:.2f} | RSI={rsi:.1f}")
+            elif sp > vwap * 1.002 and rsi > 55:
+                self._place(run, run.symbol, "SELL", qty, sp, "MIS_EQUITY", 0, product="MIS")
+                run.state = "ACTIVE"
+                run.emit(f"📉 VWAP SELL: price ₹{sp:.2f} > VWAP ₹{vwap:.2f} | RSI={rsi:.1f}")
+
+        # ── ORB mode ────────────────────────────────────────────────────────
+        elif mode == "ORB":
+            mins    = int(p.get("orb_minutes", 15))
+            open_   = now.replace(hour=9, minute=15, second=0, microsecond=0)
+            end_orb = now.replace(hour=9, minute=15 + mins, second=0, microsecond=0)
+
+            if open_ <= now < end_orb:
+                p["_h"] = max(p.get("_h", 0), sp)
+                p["_l"] = min(p.get("_l", 9e9), sp)
+                return
+
+            orb_h = p.get("_h", 0)
+            orb_l = p.get("_l", 9e9)
+            if orb_h <= 0 or orb_l >= 9e9:
+                return
+            rng = orb_h - orb_l
+
+            if sp > orb_h * 1.001:
+                sl_  = orb_h - rng * 0.5
+                tgt_ = sp + rng * float(p.get("target_mult", 2.0))
+                self._place(run, run.symbol, "BUY", qty, sp, "MIS_EQUITY", 0, product="MIS")
+                run.legs[-1].update({"sl": sl_, "tgt": tgt_})
+                run.state = "ACTIVE"
+                run.emit(f"📈 ORB BUY ₹{sp:.2f} H={orb_h} | SL ₹{sl_:.2f} tgt ₹{tgt_:.2f}")
+            elif sp < orb_l * 0.999:
+                sl_  = orb_l + rng * 0.5
+                tgt_ = sp - rng * float(p.get("target_mult", 2.0))
+                self._place(run, run.symbol, "SELL", qty, sp, "MIS_EQUITY", 0, product="MIS")
+                run.legs[-1].update({"sl": sl_, "tgt": tgt_})
+                run.state = "ACTIVE"
+                run.emit(f"📉 ORB SELL ₹{sp:.2f} L={orb_l} | SL ₹{sl_:.2f} tgt ₹{tgt_:.2f}")
+
+        # ── Momentum mode ───────────────────────────────────────────────────
+        elif mode == "Momentum":
+            fast_n = int(p.get("fast_ema", 9))
+            slow_n = int(p.get("slow_ema", 21))
+            fast   = ind.ema(fast_n)
+            slow   = ind.ema(slow_n)
+            rsi    = ind.rsi(14)
+            if fast is None or slow is None or rsi is None:
+                run.emit(f"Building indicators…"); return
+            pf = p.get("_pf")
+            ps = p.get("_ps")
+            p["_pf"], p["_ps"] = fast, slow
+            if pf is None:
+                return
+            if not (pf > ps) and (fast > slow) and rsi > 55:
+                self._place(run, run.symbol, "BUY", qty, sp, "MIS_EQUITY", 0, product="MIS")
+                run.state = "ACTIVE"
+                run.emit(f"📈 Momentum BUY EMA{fast_n}={fast:.0f}>EMA{slow_n}={slow:.0f} RSI={rsi:.1f}")
+            elif (pf > ps) and not (fast > slow) and rsi < 45:
+                self._place(run, run.symbol, "SELL", qty, sp, "MIS_EQUITY", 0, product="MIS")
+                run.state = "ACTIVE"
+                run.emit(f"📉 Momentum SELL EMA{fast_n}={fast:.0f}<EMA{slow_n}={slow:.0f} RSI={rsi:.1f}")
 
     # ── Shared helpers ─────────────────────────────────────────────────────────
 
     def _place(self, run: StrategyRun, symbol: str, side: str, qty: int,
-               price: float, opt_type: str, strike: int) -> None:
+               price: float, opt_type: str, strike: int,
+               product: Optional[str] = None) -> None:
         seg     = "DERIVATIVES" if opt_type in ("CE", "PE") else "CASH"
-        product = "NRML"        if opt_type in ("CE", "PE") else "MIS"
+        prod    = product or ("NRML" if opt_type in ("CE", "PE") else "MIS")
         mode    = "📄 Paper" if run.paper else "🔴 LIVE"
 
         if not run.paper:
-            groww.market_order(symbol, side, qty, seg, product)
+            groww.market_order(symbol, side, qty, seg, prod)
 
         trade_id = db.open_trade(run.id, run.name, symbol, side, qty, price, run.paper)
         run.legs.append({
