@@ -165,6 +165,10 @@ class AutoTrader:
         self.auto_max_runs:   int   = 3       # Max auto-created runs per scan
         self.auto_paper:      bool  = True    # Auto runs always paper until explicitly disabled
         self._last_auto_scan: float = 0.0
+        # VIX kill-switch
+        self.vix_pause_enabled: bool  = False   # Pause new entries when VIX spikes
+        self.vix_kill_level:    float = 25.0    # VIX above this → block new WAITING→ACTIVE
+        self.vix_paused:        bool  = False   # Runtime flag (read-only from UI)
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -232,6 +236,13 @@ class AutoTrader:
         if self.daily_pnl <= self.max_daily_loss:
             self.emergency_stop()
             return
+        # VIX kill-switch: pause WAITING→ACTIVE transitions when VIX spikes
+        if self.vix_pause_enabled:
+            vix_now = feed.spot("VIX")
+            if vix_now > 0:
+                self.vix_paused = vix_now >= self.vix_kill_level
+        else:
+            self.vix_paused = False
         # Auto-screener: if enabled and screener has results, add top candidates
         if self.auto_screener:
             now_ts = time.time()
@@ -243,6 +254,9 @@ class AutoTrader:
         now = datetime.now()
         for run in runs:
             if run.state in ("DONE", "ERROR"):
+                continue
+            # VIX guard: if paused, skip WAITING runs (but keep exiting ACTIVE ones)
+            if self.vix_paused and run.state == "WAITING":
                 continue
             try:
                 self._dispatch(run, now)

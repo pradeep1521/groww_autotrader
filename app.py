@@ -52,10 +52,11 @@ with st.sidebar:
 
     st.divider()
     st.caption("Pages")
-    st.page_link("app.py",                            label="📊 Dashboard")
-    st.page_link("pages/1_⚙️_Strategies.py",         label="⚙️ Options Chain · MTF · Intraday")
-    st.page_link("pages/2_📋_History.py",             label="📋 Trade History")
-    st.page_link("pages/3_🔑_Broker_Connect.py",      label="🔑 Broker Connect")
+    st.page_link("app.py",                             label="📊 Dashboard")
+    st.page_link("pages/1_⚙️_Strategies.py",          label="⚙️ Options Chain · MTF · Intraday")
+    st.page_link("pages/2_📋_History.py",              label="📋 Trade History")
+    st.page_link("pages/3_🔑_Broker_Connect.py",       label="🔑 Broker Connect")
+    st.page_link("pages/4_📈_Charts.py",               label="📈 Charts")
 
 # ── Header ─────────────────────────────────────────────────────────────────────
 st.title("📊 Live Dashboard")
@@ -66,8 +67,22 @@ total_pnl  = sum(r.pnl for r in runs)
 d_pnl      = db.daily_pnl()
 loss_pct   = abs(bot.daily_pnl / bot.max_daily_loss * 100) if bot.max_daily_loss else 0
 
+# Unrealised P&L: sum floating P&L across all open legs of ACTIVE runs
+unrealised_pnl = 0.0
+for run in runs:
+    if run.state not in ("ACTIVE", "EXITING"):
+        continue
+    for leg in run.legs:
+        if leg.get("exit_px") is not None:
+            continue
+        cur = feed.spot(leg["sym"]) or leg["entry_px"]
+        if leg["side"] == "BUY":
+            unrealised_pnl += (cur - leg["entry_px"]) * leg["qty"]
+        else:
+            unrealised_pnl += (leg["entry_px"] - cur) * leg["qty"]
+
 # ── KPI bar ────────────────────────────────────────────────────────────────────
-k1, k2, k3, k4, k5 = st.columns(5)
+k1, k2, k3, k4, k5, k6 = st.columns(6)
 k1.markdown(
     f"<div class='kpi'><div class='kpi-lbl'>Bot</div>"
     f"<div class='kpi-num' style='color:{'#065f46' if bot.is_running else '#6b7280'}'>"
@@ -80,10 +95,14 @@ k3.markdown(
     f"<div class='kpi-num' style='color:{'#065f46' if total_pnl>=0 else '#dc2626'}'>"
     f"₹{total_pnl:+,.0f}</div></div>", unsafe_allow_html=True)
 k4.markdown(
+    f"<div class='kpi'><div class='kpi-lbl'>Unrealised P&L</div>"
+    f"<div class='kpi-num' style='color:{'#065f46' if unrealised_pnl>=0 else '#dc2626'}'>"
+    f"₹{unrealised_pnl:+,.0f}</div></div>", unsafe_allow_html=True)
+k5.markdown(
     f"<div class='kpi'><div class='kpi-lbl'>Daily P&L</div>"
     f"<div class='kpi-num' style='color:{'#065f46' if d_pnl>=0 else '#dc2626'}'>"
     f"₹{d_pnl:+,.0f}</div></div>", unsafe_allow_html=True)
-k5.markdown(
+k6.markdown(
     f"<div class='kpi'><div class='kpi-lbl'>Loss limit used</div>"
     f"<div class='kpi-num' style='color:{'#dc2626' if loss_pct>75 else '#374151'}'>"
     f"{loss_pct:.0f}%</div></div>", unsafe_allow_html=True)
@@ -116,6 +135,48 @@ new_limit = bc4.number_input(
     help="Kill-switch: bot stops all trades when daily loss hits this", key="dash_limit"
 )
 bot.max_daily_loss = -abs(new_limit)
+
+# ── VIX kill-switch + auto-screener controls ────────────────────────────────────
+vc1, vc2, vc3, vc4 = st.columns([2, 2, 2, 2])
+
+vix_enabled = vc1.toggle(
+    "VIX kill-switch",
+    value=bot.vix_pause_enabled,
+    key="dash_vix_en",
+    help="When ON, blocks new entries while VIX ≥ threshold",
+)
+bot.vix_pause_enabled = vix_enabled
+
+vix_lvl = vc2.number_input(
+    "VIX threshold", value=float(bot.vix_kill_level),
+    min_value=10.0, max_value=60.0, step=1.0,
+    disabled=not vix_enabled, key="dash_vix_lvl",
+    help="Pause new entries when India VIX reaches this level",
+)
+bot.vix_kill_level = vix_lvl
+
+if bot.vix_pause_enabled:
+    vix_now = feed.spot("VIX")
+    if bot.vix_paused:
+        vc2.warning(f"⚠️ VIX {vix_now:.1f} — entries PAUSED")
+    else:
+        vc2.caption(f"VIX now: {vix_now:.1f}")
+
+scr_enabled = vc3.toggle(
+    "Auto-screener",
+    value=bot.auto_screener,
+    key="dash_scr_en",
+    help="Automatically add top-momentum stocks as strategy runs",
+)
+bot.auto_screener = scr_enabled
+
+scr_max = vc4.number_input(
+    "Max auto-runs", value=int(bot.auto_max_runs),
+    min_value=1, max_value=10, step=1,
+    disabled=not scr_enabled, key="dash_scr_max",
+    help="Maximum strategy runs the auto-screener can add per scan",
+)
+bot.auto_max_runs = scr_max
 
 st.divider()
 
