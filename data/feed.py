@@ -21,29 +21,47 @@ _lock   = threading.Lock()
 
 
 def _yf_fetch(symbol: str) -> Optional[dict]:
-    """Fetch latest quote from yfinance."""
+    """
+    Fetch latest quote from yfinance.
+
+    Uses history(period='5d') instead of fast_info to avoid yfinance
+    internally triggering a 1-year download (which floods logs with
+    'possibly delisted' warnings for Indian index tickers).
+    """
     try:
+        import logging
         import yfinance as yf
-        yf_sym = _YF_SYMBOLS.get(symbol.upper(), symbol + ".NS")
-        tk     = yf.Ticker(yf_sym)
-        info   = tk.fast_info
-        price  = getattr(info, "last_price", None) or getattr(info, "regularMarketPrice", None)
-        prev   = getattr(info, "previous_close", None) or price
-        if price and float(price) > 0:
-            chg     = float(price) - float(prev or price)
-            chg_pct = chg / float(prev) * 100 if prev else 0.0
-            return {
-                "symbol":     symbol,
-                "price":      round(float(price), 2),
-                "prev_close": round(float(prev), 2),
-                "change":     round(chg, 2),
-                "change_pct": round(chg_pct, 2),
-                "source":     "yfinance",
-                "ts":         datetime.now().isoformat(),
-            }
+
+        # Suppress yfinance's noisy download warnings at the fetch level
+        _yf_logger = logging.getLogger("yfinance")
+        _prev_level = _yf_logger.level
+        _yf_logger.setLevel(logging.CRITICAL)
+
+        try:
+            yf_sym = _YF_SYMBOLS.get(symbol.upper(), symbol.upper() + ".NS")
+            hist   = yf.Ticker(yf_sym).history(period="5d", interval="1d", auto_adjust=True)
+        finally:
+            _yf_logger.setLevel(_prev_level)
+
+        if hist.empty:
+            return None
+        price = float(hist["Close"].iloc[-1])
+        prev  = float(hist["Close"].iloc[-2]) if len(hist) >= 2 else price
+        if price <= 0:
+            return None
+        chg     = price - prev
+        chg_pct = chg / prev * 100 if prev > 0 else 0.0
+        return {
+            "symbol":     symbol,
+            "price":      round(price, 2),
+            "prev_close": round(prev, 2),
+            "change":     round(chg, 2),
+            "change_pct": round(chg_pct, 2),
+            "source":     "yfinance",
+            "ts":         datetime.now().isoformat(),
+        }
     except Exception:
-        pass
-    return None
+        return None
 
 
 def get_price(symbol: str) -> Optional[dict]:
@@ -73,6 +91,38 @@ def spot(symbol: str) -> float:
     """Convenience: just return the float price (0.0 on failure)."""
     q = get_price(symbol)
     return float((q or {}).get("price", 0) or 0)
+
+
+def ohlcv(symbol: str, period: str = "1d", interval: str = "5m"):
+    """
+    Return a pandas DataFrame with columns [Open, High, Low, Close, Volume]
+    for charting.  Uses yfinance history().
+
+    period   — '1d','5d','1mo','3mo','6mo','1y','2y'
+    interval — '1m','5m','15m','30m','1h','1d','1wk'
+    """
+    try:
+        import yfinance as yf
+        yf_sym = _YF_SYMBOLS.get(symbol.upper(), symbol.upper() + ".NS")
+        df     = yf.Ticker(yf_sym).history(period=period, interval=interval)
+        if df.empty:
+            return None
+        df.index = df.index.tz_localize(None) if df.index.tzinfo else df.index
+        return df[["Open", "High", "Low", "Close", "Volume"]].copy()
+    except Exception:
+        return None
+
+
+def batch_refresh(symbols: list) -> dict:
+    """Force-refresh prices for a list of symbols. Returns {symbol: price_dict}."""
+    results = {}
+    for sym in symbols:
+        q = _yf_fetch(sym)
+        if q:
+            with _lock:
+                _cache[sym.upper()] = q
+            results[sym.upper()] = q
+    return results
 
 
 # ── Background poller ──────────────────────────────────────────────────────────

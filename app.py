@@ -14,6 +14,7 @@ import streamlit as st
 from broker.groww import connector
 from data import db, feed
 from engine.bot import STRATEGY_NAMES, bot
+from engine.screener import screener
 
 st.set_page_config(page_title="AutoTrader", page_icon="🤖", layout="wide")
 
@@ -170,6 +171,85 @@ except Exception:
                       "<div class='kpi-num'>—</div></div>", unsafe_allow_html=True)
     _cols[4].markdown("<div class='kpi'><div class='kpi-lbl'>Max Pain</div>"
                       "<div class='kpi-num'>—</div></div>", unsafe_allow_html=True)
+
+st.divider()
+
+# ── Screener snapshot ──────────────────────────────────────────────────────────
+st.subheader("🔍 Screener Snapshot")
+
+scr_results = screener.get_results()
+if not scr_results:
+    col_sa, col_sb = st.columns([3, 1])
+    col_sa.caption("No scan data yet. Run a scan from the Screener tab, or enable auto-screener.")
+    if col_sb.button("⚡ Quick scan (Nifty 50)", key="dash_qscan"):
+        screener.universe = "nifty50"
+        with st.spinner("Scanning Nifty 50…"):
+            screener.scan()
+        st.rerun()
+else:
+    regime = screener.regime
+    vix    = feed.spot("VIX") or 15
+    last_t = screener.last_scan.strftime("%H:%M") if screener.last_scan else "—"
+
+    # Regime pill
+    regime_html = {
+        "TRENDING": "<span style='background:#d1fae5;color:#065f46;border-radius:6px;"
+                    "padding:3px 12px;font-weight:700;font-size:.82rem'>📈 TRENDING</span>",
+        "VOLATILE": "<span style='background:#fef3c7;color:#92400e;border-radius:6px;"
+                    "padding:3px 12px;font-weight:700;font-size:.82rem'>⚡ VOLATILE</span>",
+        "NORMAL":   "<span style='background:#ede9fe;color:#5b21b6;border-radius:6px;"
+                    "padding:3px 12px;font-weight:700;font-size:.82rem'>↔️ NORMAL</span>",
+    }.get(regime, regime)
+    st.markdown(
+        f"Market regime: {regime_html} &nbsp;·&nbsp; VIX {vix:.1f} "
+        f"&nbsp;·&nbsp; {len(scr_results)} stocks scanned &nbsp;·&nbsp; last scan {last_t}",
+        unsafe_allow_html=True,
+    )
+    st.write("")
+
+    # Top 5 momentum + top 5 reversion side by side
+    scr_l, scr_r = st.columns(2)
+    with scr_l:
+        st.markdown("**🚀 Top Momentum** _(Intraday)_")
+        top_mom = screener.top_momentum(5)
+        for s in top_mom:
+            bar_w = s["mom_score"]
+            st.markdown(
+                f"<div style='display:flex;justify-content:space-between;"
+                f"align-items:center;margin-bottom:4px'>"
+                f"<div><b>{s['symbol']}</b> "
+                f"<span style='color:#6b7280;font-size:.8rem'>₹{s['price']:,.0f} "
+                f"· RSI {s['rsi']:.0f}</span></div>"
+                f"<div style='background:#d1fae5;border-radius:4px;padding:1px 8px;"
+                f"font-weight:700;font-size:.82rem;color:#065f46'>{s['mom_score']}</div>"
+                f"</div>"
+                f"<div style='height:4px;background:#e5e7eb;border-radius:2px;margin-bottom:8px'>"
+                f"<div style='height:4px;width:{bar_w}%;background:#1a7f3c;"
+                f"border-radius:2px'></div></div>",
+                unsafe_allow_html=True,
+            )
+
+    with scr_r:
+        st.markdown("**📉 Top Reversion** _(MTF)_")
+        top_rev = screener.top_reversion(5)
+        for s in top_rev:
+            bar_w = s["rev_score"]
+            st.markdown(
+                f"<div style='display:flex;justify-content:space-between;"
+                f"align-items:center;margin-bottom:4px'>"
+                f"<div><b>{s['symbol']}</b> "
+                f"<span style='color:#6b7280;font-size:.8rem'>₹{s['price']:,.0f} "
+                f"· RSI {s['rsi']:.0f}</span></div>"
+                f"<div style='background:#fce7f3;border-radius:4px;padding:1px 8px;"
+                f"font-weight:700;font-size:.82rem;color:#9d174d'>{s['rev_score']}</div>"
+                f"</div>"
+                f"<div style='height:4px;background:#e5e7eb;border-radius:2px;margin-bottom:8px'>"
+                f"<div style='height:4px;width:{bar_w}%;background:#dc2626;"
+                f"border-radius:2px'></div></div>",
+                unsafe_allow_html=True,
+            )
+
+    st.page_link("pages/1_⚙️_Strategies.py", label="→ Open Screener tab for full results & one-click trade setup")
 
 st.divider()
 
