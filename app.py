@@ -1,416 +1,376 @@
 """
-Groww AutoTrader — Live Dashboard
-==================================
-Monitors running strategies in real-time. Auto-refreshes every 5s while bot is active.
+Groww Signal Dashboard
+======================
+Shows live BUY/SELL signals for stocks and NIFTY/BANKNIFTY options.
+Notifies you (toast + sound) when a new signal fires — you place the order on Groww.
+
+No jargon. No bot controls. Just signals.
 """
 
 import time
-from datetime import datetime
 
-import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
 from broker.groww import connector
-from data import db, feed
-from engine.bot import STRATEGY_NAMES, bot
+from data import feed
 from engine.screener import screener
 
-st.set_page_config(page_title="AutoTrader", page_icon="🤖", layout="wide")
+st.set_page_config(
+    page_title="Signal Dashboard",
+    page_icon="📡",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 # ── CSS ────────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-.chip { border-radius:4px; padding:2px 10px; font-size:.76rem; font-weight:700; }
-.chip-wait  { background:#fef3c7; color:#92400e; }
-.chip-on    { background:#d1fae5; color:#065f46; }
-.chip-done  { background:#ede9fe; color:#5b21b6; }
-.chip-err   { background:#fee2e2; color:#991b1b; }
-.chip-exit  { background:#fce7f3; color:#9d174d; }
-.kpi { background:#f9fafb; border:1px solid #e5e7eb; border-radius:10px;
-       padding:14px 18px; text-align:center; }
-.kpi-num  { font-size:1.4rem; font-weight:800; }
-.kpi-lbl  { font-size:.72rem; color:#6b7280; margin-bottom:2px; }
+.sig-card {
+    border-radius: 14px;
+    padding: 18px 22px;
+    margin-bottom: 12px;
+}
+.sig-buy  { background: #f0fdf4; border: 2px solid #16a34a; }
+.sig-sell { background: #fff1f2; border: 2px solid #e11d48; }
+.sig-neu  { background: #f8fafc; border: 2px solid #94a3b8; }
+
+.mkt {
+    background: #f9fafb;
+    border: 1px solid #e5e7eb;
+    border-radius: 12px;
+    padding: 16px 20px;
+    text-align: center;
+}
+
+.tag {
+    display: inline-block;
+    border-radius: 5px;
+    padding: 2px 10px;
+    font-size: .76rem;
+    font-weight: 700;
+    letter-spacing: .02em;
+}
+.tag-buy  { background: #dcfce7; color: #166534; }
+.tag-sell { background: #ffe4e6; color: #9f1239; }
+.tag-neu  { background: #e0f2fe; color: #075985; }
+.tag-new  { background: #fef9c3; color: #713f12; }
+
+.stat-row { display: flex; gap: 28px; margin-top: 12px; flex-wrap: wrap; }
+.stat-col { display: flex; flex-direction: column; }
+.stat-lbl { font-size: .68rem; color: #64748b; font-weight: 600;
+            text-transform: uppercase; letter-spacing: .04em; margin-bottom: 2px; }
+.stat-val { font-size: 1.05rem; font-weight: 700; }
+.val-sl   { color: #e11d48; }
+.val-tgt  { color: #16a34a; }
 </style>
 """, unsafe_allow_html=True)
 
+
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.image("https://img.icons8.com/fluency/48/robot-2.png", width=48)
-    st.title("AutoTrader")
-    st.caption("Automated strategy execution via Groww API")
-
+    st.markdown("## 📡 Signal Dashboard")
     st.divider()
+
     if connector.is_connected:
-        st.success("🟢 Groww connected — LIVE orders enabled")
-        m = connector.margin()
-        st.metric("Available margin", f"₹{m.get('available', 0):,.0f}")
-        st.metric("F&O margin",       f"₹{m.get('fno', 0):,.0f}")
+        st.success("🟢 Connected to Groww")
+        try:
+            m = connector.margin()
+            st.metric("Available margin", f"₹{m.get('available', 0):,.0f}")
+        except Exception:
+            pass
     else:
-        st.info("🔵 Not connected — Paper mode only")
-        st.page_link("pages/3_🔑_Broker_Connect.py", label="Connect Groww →")
+        st.info("🔵 Not connected — **paper mode**")
+        st.page_link("pages/3_🔑_Broker_Connect.py", label="🔑 Connect to Groww →")
 
     st.divider()
-    st.caption("Pages")
-    st.page_link("app.py",                             label="📊 Dashboard")
-    st.page_link("pages/1_⚙️_Strategies.py",          label="⚙️ Options Chain · MTF · Intraday")
-    st.page_link("pages/2_📋_History.py",              label="📋 Trade History")
-    st.page_link("pages/3_🔑_Broker_Connect.py",       label="🔑 Broker Connect")
-    st.page_link("pages/4_📈_Charts.py",               label="📈 Charts")
+    st.caption("PAGES")
+    st.page_link("app.py",                           label="📡 Signals")
+    st.page_link("pages/2_📋_History.py",            label="📋 Trade History")
+    st.page_link("pages/3_🔑_Broker_Connect.py",     label="🔑 Broker Connect")
+    st.page_link("pages/4_📈_Charts.py",             label="📈 Charts")
 
-# ── Header ─────────────────────────────────────────────────────────────────────
-st.title("📊 Live Dashboard")
+    st.divider()
+    st.caption("SETTINGS")
+    sound_on  = st.toggle("🔔 Sound alert on new signal", value=True,  key="snd")
+    notif_on  = st.toggle("🖥 Browser notifications",     value=False, key="notif")
+    auto_scan = st.toggle("♻️ Auto-scan every 15 min",   value=True,  key="auto")
 
-runs       = bot.get_runs()
-active_cnt = sum(1 for r in runs if r.state == "ACTIVE")
-total_pnl  = sum(r.pnl for r in runs)
-d_pnl      = db.daily_pnl()
-loss_pct   = abs(bot.daily_pnl / bot.max_daily_loss * 100) if bot.max_daily_loss else 0
 
-# Unrealised P&L: sum floating P&L across all open legs of ACTIVE runs
-unrealised_pnl = 0.0
-for run in runs:
-    if run.state not in ("ACTIVE", "EXITING"):
-        continue
-    for leg in run.legs:
-        if leg.get("exit_px") is not None:
-            continue
-        cur = feed.spot(leg["sym"]) or leg["entry_px"]
-        if leg["side"] == "BUY":
-            unrealised_pnl += (cur - leg["entry_px"]) * leg["qty"]
-        else:
-            unrealised_pnl += (leg["entry_px"] - cur) * leg["qty"]
-
-# ── KPI bar ────────────────────────────────────────────────────────────────────
-k1, k2, k3, k4, k5, k6 = st.columns(6)
-k1.markdown(
-    f"<div class='kpi'><div class='kpi-lbl'>Bot</div>"
-    f"<div class='kpi-num' style='color:{'#065f46' if bot.is_running else '#6b7280'}'>"
-    f"{'▶ ON' if bot.is_running else '⏹ OFF'}</div></div>", unsafe_allow_html=True)
-k2.markdown(
-    f"<div class='kpi'><div class='kpi-lbl'>Active runs</div>"
-    f"<div class='kpi-num'>{active_cnt}</div></div>", unsafe_allow_html=True)
-k3.markdown(
-    f"<div class='kpi'><div class='kpi-lbl'>Session P&L</div>"
-    f"<div class='kpi-num' style='color:{'#065f46' if total_pnl>=0 else '#dc2626'}'>"
-    f"₹{total_pnl:+,.0f}</div></div>", unsafe_allow_html=True)
-k4.markdown(
-    f"<div class='kpi'><div class='kpi-lbl'>Unrealised P&L</div>"
-    f"<div class='kpi-num' style='color:{'#065f46' if unrealised_pnl>=0 else '#dc2626'}'>"
-    f"₹{unrealised_pnl:+,.0f}</div></div>", unsafe_allow_html=True)
-k5.markdown(
-    f"<div class='kpi'><div class='kpi-lbl'>Daily P&L</div>"
-    f"<div class='kpi-num' style='color:{'#065f46' if d_pnl>=0 else '#dc2626'}'>"
-    f"₹{d_pnl:+,.0f}</div></div>", unsafe_allow_html=True)
-k6.markdown(
-    f"<div class='kpi'><div class='kpi-lbl'>Loss limit used</div>"
-    f"<div class='kpi-num' style='color:{'#dc2626' if loss_pct>75 else '#374151'}'>"
-    f"{loss_pct:.0f}%</div></div>", unsafe_allow_html=True)
-
-st.write("")
-
-# ── Bot controls ───────────────────────────────────────────────────────────────
-bc1, bc2, bc3, bc4 = st.columns([2, 2, 2, 4])
-if bc1.button("▶ Start" if not bot.is_running else "⏹ Stop",
-              type="primary" if not bot.is_running else "secondary",
-              use_container_width=True, key="dash_start"):
-    if bot.is_running:
-        bot.stop()
-    else:
-        bot.start()
-    st.rerun()
-
-if bc2.button("🚨 Emergency Stop", use_container_width=True, key="dash_emg",
-              help="Square off ALL positions now"):
-    bot.emergency_stop()
-    st.rerun()
-
-if bc3.button("🗑 Clear finished", use_container_width=True, key="dash_clear"):
-    bot.clear_done()
-    st.rerun()
-
-new_limit = bc4.number_input(
-    "Max daily loss ₹", value=float(abs(bot.max_daily_loss)),
-    min_value=500.0, step=500.0, label_visibility="collapsed",
-    help="Kill-switch: bot stops all trades when daily loss hits this", key="dash_limit"
+# ── Page header ────────────────────────────────────────────────────────────────
+st.title("📡 Signal Dashboard")
+st.caption(
+    "Scans Nifty 50 stocks and the options chain every 15 minutes. "
+    "When a signal fires you will be notified — place the order yourself on Groww."
 )
-bot.max_daily_loss = -abs(new_limit)
 
-# ── VIX kill-switch + auto-screener controls ────────────────────────────────────
-vc1, vc2, vc3, vc4 = st.columns([2, 2, 2, 2])
 
-vix_enabled = vc1.toggle(
-    "VIX kill-switch",
-    value=bot.vix_pause_enabled,
-    key="dash_vix_en",
-    help="When ON, blocks new entries while VIX ≥ threshold",
-)
-bot.vix_pause_enabled = vix_enabled
-
-vix_lvl = vc2.number_input(
-    "VIX threshold", value=float(bot.vix_kill_level),
-    min_value=10.0, max_value=60.0, step=1.0,
-    disabled=not vix_enabled, key="dash_vix_lvl",
-    help="Pause new entries when India VIX reaches this level",
-)
-bot.vix_kill_level = vix_lvl
-
-if bot.vix_pause_enabled:
-    vix_now = feed.spot("VIX")
-    if bot.vix_paused:
-        vc2.warning(f"⚠️ VIX {vix_now:.1f} — entries PAUSED")
-    else:
-        vc2.caption(f"VIX now: {vix_now:.1f}")
-
-scr_enabled = vc3.toggle(
-    "Auto-screener",
-    value=bot.auto_screener,
-    key="dash_scr_en",
-    help="Automatically add top-momentum stocks as strategy runs",
-)
-bot.auto_screener = scr_enabled
-
-scr_max = vc4.number_input(
-    "Max auto-runs", value=int(bot.auto_max_runs),
-    min_value=1, max_value=10, step=1,
-    disabled=not scr_enabled, key="dash_scr_max",
-    help="Maximum strategy runs the auto-screener can add per scan",
-)
-bot.auto_max_runs = scr_max
-
-st.divider()
-
-# ── Market + Options Chain snapshot ────────────────────────────────────────────
-st.subheader("📡 Market Snapshot")
-
-_syms = ["NIFTY", "BANKNIFTY", "VIX"]
-_cols = st.columns(len(_syms) + 2)   # +2 for PCR and MaxPain
-
-for col, sym in zip(_cols[:len(_syms)], _syms):
+# ── Market snapshot ────────────────────────────────────────────────────────────
+c1, c2, c3 = st.columns(3)
+for col, sym, label in [
+    (c1, "NIFTY",     "NIFTY 50"),
+    (c2, "BANKNIFTY", "BANK NIFTY"),
+    (c3, "VIX",       "India VIX"),
+]:
     q   = feed.get_price(sym) or {}
-    px  = q.get("price", 0)
-    chg = q.get("change_pct", 0)
-    clr = "#065f46" if chg >= 0 else "#dc2626"
-    if isinstance(px, float) and px > 0:
-        col.markdown(
-            f"<div class='kpi'><div class='kpi-lbl'>{sym}</div>"
-            f"<div style='font-weight:700;font-size:1.1rem'>₹{px:,.2f}</div>"
-            f"<div style='color:{clr};font-size:.82rem;font-weight:600'>{chg:+.2f}%</div></div>",
-            unsafe_allow_html=True,
-        )
-    else:
-        col.markdown(
-            f"<div class='kpi'><div class='kpi-lbl'>{sym}</div>"
-            f"<div style='font-weight:700;font-size:1.1rem'>—</div></div>",
-            unsafe_allow_html=True,
-        )
+    px  = q.get("price", 0.0)
+    chg = q.get("change_pct", 0.0)
+    clr = "#16a34a" if chg >= 0 else "#e11d48"
+    arr = "▲" if chg >= 0 else "▼"
+    col.markdown(
+        f"<div class='mkt'>"
+        f"<div style='font-size:.72rem;color:#6b7280;font-weight:600'>{label}</div>"
+        f"<div style='font-size:1.6rem;font-weight:800;line-height:1.2'>₹{px:,.2f}</div>"
+        f"<div style='font-size:.9rem;color:{clr};font-weight:700;margin-top:2px'>"
+        f"{arr} {abs(chg):.2f}%</div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
 
-# PCR + MaxPain from options chain (cached — won't block)
-try:
-    from engine.options_chain import max_pain, parse_chain, pcr
-    _df  = parse_chain("NIFTY")
-    _pcr = pcr(_df) if not _df.empty else None
-    _mp  = max_pain(_df) if not _df.empty else None
-    pcr_clr = "#065f46" if _pcr and _pcr > 1 else "#dc2626" if _pcr and _pcr < 0.8 else "#374151"
-    _cols[3].markdown(
-        f"<div class='kpi'><div class='kpi-lbl'>NIFTY PCR</div>"
-        f"<div class='kpi-num' style='color:{pcr_clr}'>"
-        f"{_pcr:.3f}" if _pcr else "—"
-        f"</div><div style='font-size:.72rem;color:#6b7280'>"
-        f"{'Bullish' if _pcr and _pcr>1.2 else 'Bearish' if _pcr and _pcr<0.8 else 'Neutral'}"
-        f"</div></div>",
-        unsafe_allow_html=True,
+vix = feed.spot("VIX") or 0.0
+st.write("")
+if vix >= 25:
+    st.error(
+        f"⚠️ **VIX {vix:.1f} — Very high volatility.**  "
+        "Consider smaller position sizes or wait for VIX to cool below 22."
     )
-    _cols[4].markdown(
-        f"<div class='kpi'><div class='kpi-lbl'>Max Pain</div>"
-        f"<div class='kpi-num'>{_mp:,}" if _mp else "<div class='kpi-num'>—"
-        f"</div></div>",
-        unsafe_allow_html=True,
-    )
-except Exception:
-    _cols[3].markdown("<div class='kpi'><div class='kpi-lbl'>NIFTY PCR</div>"
-                      "<div class='kpi-num'>—</div></div>", unsafe_allow_html=True)
-    _cols[4].markdown("<div class='kpi'><div class='kpi-lbl'>Max Pain</div>"
-                      "<div class='kpi-num'>—</div></div>", unsafe_allow_html=True)
+elif vix >= 20:
+    st.warning(f"⚠️ **VIX {vix:.1f} — Elevated risk.**  Use smaller position sizes.")
 
 st.divider()
 
-# ── Screener snapshot ──────────────────────────────────────────────────────────
-st.subheader("🔍 Screener Snapshot")
 
-scr_results = screener.get_results()
-if not scr_results:
-    col_sa, col_sb = st.columns([3, 1])
-    col_sa.caption("No scan data yet. Run a scan from the Screener tab, or enable auto-screener.")
-    if col_sb.button("⚡ Quick scan (Nifty 50)", key="dash_qscan"):
+# ── Run screener if needed ─────────────────────────────────────────────────────
+if screener.last_scan is None:
+    with st.spinner("📊 Scanning Nifty 50 stocks for signals — takes about 25 s ..."):
         screener.universe = "nifty50"
-        with st.spinner("Scanning Nifty 50…"):
-            screener.scan()
-        st.rerun()
-else:
-    regime = screener.regime
-    vix    = feed.spot("VIX") or 15
-    last_t = screener.last_scan.strftime("%H:%M") if screener.last_scan else "—"
+        screener.scan()
+elif auto_scan and not screener._running:
+    screener.universe = "nifty50"
+    screener.start()   # background thread — scans every 15 min
 
-    # Regime pill
-    regime_html = {
-        "TRENDING": "<span style='background:#d1fae5;color:#065f46;border-radius:6px;"
-                    "padding:3px 12px;font-weight:700;font-size:.82rem'>📈 TRENDING</span>",
-        "VOLATILE": "<span style='background:#fef3c7;color:#92400e;border-radius:6px;"
-                    "padding:3px 12px;font-weight:700;font-size:.82rem'>⚡ VOLATILE</span>",
-        "NORMAL":   "<span style='background:#ede9fe;color:#5b21b6;border-radius:6px;"
-                    "padding:3px 12px;font-weight:700;font-size:.82rem'>↔️ NORMAL</span>",
-    }.get(regime, regime)
-    st.markdown(
-        f"Market regime: {regime_html} &nbsp;·&nbsp; VIX {vix:.1f} "
-        f"&nbsp;·&nbsp; {len(scr_results)} stocks scanned &nbsp;·&nbsp; last scan {last_t}",
-        unsafe_allow_html=True,
+
+# ── Build signals (reads from screener cache — instant) ────────────────────────
+from engine.signal_builder import options_signals, stock_signals  # noqa: E402
+
+sigs     = stock_signals(8)
+opt_sigs = options_signals()
+
+
+# ── Detect new signals and notify ─────────────────────────────────────────────
+sig_keys  = frozenset(f"{s['symbol']}_{s['direction']}" for s in sigs)
+prev_keys = st.session_state.get("_prev_sig_keys", frozenset())
+new_keys  = sig_keys - prev_keys
+st.session_state["_prev_sig_keys"] = sig_keys
+
+if new_keys:
+    for k in new_keys:
+        st.toast(f"🔔 New signal: {k.split('_')[0]}", icon="📡")
+
+    if sound_on:
+        components.html(
+            """
+            <script>
+            (function() {
+              try {
+                var ctx = new (window.AudioContext || window.webkitAudioContext)();
+                [880, 1100, 1320].forEach(function(freq, i) {
+                  var o = ctx.createOscillator(), g = ctx.createGain();
+                  o.type = 'sine'; o.frequency.value = freq;
+                  var t = ctx.currentTime + i * 0.18;
+                  g.gain.setValueAtTime(0.25, t);
+                  g.gain.exponentialRampToValueAtTime(0.001, t + 0.22);
+                  o.connect(g); g.connect(ctx.destination);
+                  o.start(t); o.stop(t + 0.25);
+                });
+              } catch(e) {}
+            })();
+            </script>
+            """,
+            height=0,
+        )
+
+    if notif_on:
+        syms_str = ", ".join(k.split("_")[0] for k in new_keys)
+        components.html(
+            f"""
+            <script>
+            (function() {{
+              if (typeof Notification === 'undefined') return;
+              function send() {{
+                new Notification('📡 New signal', {{
+                  body: '{syms_str}',
+                  icon: 'https://img.icons8.com/fluency/48/robot-2.png'
+                }});
+              }}
+              if (Notification.permission === 'granted') {{
+                send();
+              }} else if (Notification.permission !== 'denied') {{
+                Notification.requestPermission().then(function(p) {{
+                  if (p === 'granted') send();
+                }});
+              }}
+            }})();
+            </script>
+            """,
+            height=0,
+        )
+
+
+# ── Stock signals ──────────────────────────────────────────────────────────────
+st.subheader(f"📈 Stock Signals  ·  {len(sigs)} found")
+
+if not sigs:
+    st.info(
+        "**No signals right now.**\n\n"
+        "This is normal — the market may be closed, or no stock has a clean setup yet. "
+        "Click **Scan Now** below or wait for the auto-scan."
     )
-    st.write("")
+else:
+    for s in sigs:
+        is_new  = f"{s['symbol']}_{s['direction']}" in new_keys
+        is_buy  = s["direction"] == "BUY"
+        css     = "sig-buy" if is_buy else "sig-sell"
+        emoji   = "🟢" if is_buy else "🔴"
+        tag_css = "tag-buy" if is_buy else "tag-sell"
+        new_tag = "<span class='tag tag-new'>⚡ NEW</span>&nbsp;" if is_new else ""
+        setup   = "Momentum" if s["setup"] == "MOMENTUM" else "Oversold bounce"
 
-    # Top 5 momentum + top 5 reversion side by side
-    scr_l, scr_r = st.columns(2)
-    with scr_l:
-        st.markdown("**🚀 Top Momentum** _(Intraday)_")
-        top_mom = screener.top_momentum(5)
-        for s in top_mom:
-            bar_w = s["mom_score"]
-            st.markdown(
-                f"<div style='display:flex;justify-content:space-between;"
-                f"align-items:center;margin-bottom:4px'>"
-                f"<div><b>{s['symbol']}</b> "
-                f"<span style='color:#6b7280;font-size:.8rem'>₹{s['price']:,.0f} "
-                f"· RSI {s['rsi']:.0f}</span></div>"
-                f"<div style='background:#d1fae5;border-radius:4px;padding:1px 8px;"
-                f"font-weight:700;font-size:.82rem;color:#065f46'>{s['mom_score']}</div>"
-                f"</div>"
-                f"<div style='height:4px;background:#e5e7eb;border-radius:2px;margin-bottom:8px'>"
-                f"<div style='height:4px;width:{bar_w}%;background:#1a7f3c;"
-                f"border-radius:2px'></div></div>",
-                unsafe_allow_html=True,
-            )
+        st.markdown(
+            f"""
+            <div class='sig-card {css}'>
+              <div style='display:flex;justify-content:space-between;
+                          align-items:flex-start;gap:12px'>
+                <div>
+                  {new_tag}
+                  <span style='font-size:1.2rem;font-weight:800'>
+                    {emoji} {s['direction']} &nbsp;
+                    <span style='font-family:monospace'>{s['symbol']}</span>
+                  </span>
+                  &nbsp;<span class='tag {tag_css}'>{setup}</span>
+                  <div style='color:#475569;font-size:.84rem;margin-top:5px'>
+                    {s['reason']}
+                  </div>
+                </div>
+                <div style='text-align:right;white-space:nowrap'>
+                  <div style='font-size:.68rem;color:#94a3b8;font-weight:600'>SIGNAL SCORE</div>
+                  <div style='font-size:1.1rem;font-weight:800;color:#334155'>{s['score']:.0f}/100</div>
+                </div>
+              </div>
+              <div class='stat-row'>
+                <div class='stat-col'>
+                  <span class='stat-lbl'>Entry price</span>
+                  <span class='stat-val'>₹{s['price']:,.2f}</span>
+                </div>
+                <div class='stat-col'>
+                  <span class='stat-lbl'>Stop-Loss</span>
+                  <span class='stat-val val-sl'>₹{s['sl']:,.2f}</span>
+                </div>
+                <div class='stat-col'>
+                  <span class='stat-lbl'>Target</span>
+                  <span class='stat-val val-tgt'>₹{s['target']:,.2f}</span>
+                </div>
+                <div class='stat-col'>
+                  <span class='stat-lbl'>Risk : Reward</span>
+                  <span class='stat-val'>1 : {s['risk_reward']}</span>
+                </div>
+                <div class='stat-col'>
+                  <span class='stat-lbl'>RSI</span>
+                  <span class='stat-val'>{s['rsi']}</span>
+                </div>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-    with scr_r:
-        st.markdown("**📉 Top Reversion** _(MTF)_")
-        top_rev = screener.top_reversion(5)
-        for s in top_rev:
-            bar_w = s["rev_score"]
-            st.markdown(
-                f"<div style='display:flex;justify-content:space-between;"
-                f"align-items:center;margin-bottom:4px'>"
-                f"<div><b>{s['symbol']}</b> "
-                f"<span style='color:#6b7280;font-size:.8rem'>₹{s['price']:,.0f} "
-                f"· RSI {s['rsi']:.0f}</span></div>"
-                f"<div style='background:#fce7f3;border-radius:4px;padding:1px 8px;"
-                f"font-weight:700;font-size:.82rem;color:#9d174d'>{s['rev_score']}</div>"
-                f"</div>"
-                f"<div style='height:4px;background:#e5e7eb;border-radius:2px;margin-bottom:8px'>"
-                f"<div style='height:4px;width:{bar_w}%;background:#dc2626;"
-                f"border-radius:2px'></div></div>",
-                unsafe_allow_html=True,
-            )
 
-    st.page_link("pages/1_⚙️_Strategies.py", label="→ Open Screener tab for full results & one-click trade setup")
-
+# ── Options signals ────────────────────────────────────────────────────────────
 st.divider()
+st.subheader("📊 Options Signals  ·  NIFTY & BANK NIFTY")
 
-# ── Strategy run cards ─────────────────────────────────────────────────────────
-st.subheader("🏃 Running Strategies")
-
-if not runs:
-    st.markdown("""
-    <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:12px;
-    padding:48px;text-align:center">
-    <div style="font-size:3rem">🤖</div>
-    <div style="font-weight:700;font-size:1.1rem;margin:10px 0">No strategies active</div>
-    <div style="color:#6b7280">Go to <b>Strategy Manager</b> to add one.</div>
-    </div>
-    """, unsafe_allow_html=True)
+if not opt_sigs:
+    st.info(
+        "Options chain data is unavailable right now.  "
+        "NSE's API is typically accessible during market hours (9:15 AM – 3:30 PM IST)."
+    )
 else:
-    for run in runs:
-        chip_cls = {
-            "WAITING": "chip-wait", "ACTIVE": "chip-on",
-            "EXITING": "chip-exit", "DONE": "chip-done", "ERROR": "chip-err",
-        }.get(run.state, "chip-wait")
-        pnl_clr = "#065f46" if run.pnl >= 0 else "#dc2626"
-        mode    = "📄 Paper" if run.paper else "🔴 LIVE"
+    for o in opt_sigs:
+        is_buy = o["color"] == "BUY"
+        is_neu = o["color"] == "NEUTRAL"
+        css    = "sig-buy" if is_buy else ("sig-sell" if not is_neu else "sig-neu")
+        emoji  = "🟢" if is_buy else ("🔴" if not is_neu else "🟡")
+        t_css  = "tag-buy" if is_buy else ("tag-sell" if not is_neu else "tag-neu")
 
-        with st.container(border=True):
-            h1, h2, h3, h4, h5 = st.columns([3, 1.5, 1.5, 1.5, 1])
-            h1.markdown(
-                f"<b style='font-size:1rem'>{run.name}</b> "
-                f"<code style='font-size:.8rem'>{run.id}</code><br>"
-                f"<span style='font-size:.8rem;color:#6b7280'>"
-                f"{run.symbol} · {run.lots} lot{'s' if run.lots>1 else ''} · {mode}</span>",
-                unsafe_allow_html=True,
-            )
-            h2.markdown(
-                f"<div style='font-size:.72rem;color:#6b7280'>P&L</div>"
-                f"<div style='font-weight:800;color:{pnl_clr};font-size:1.05rem'>"
-                f"₹{run.pnl:+,.0f}</div>", unsafe_allow_html=True)
-            h3.markdown(
-                f"<div style='font-size:.72rem;color:#6b7280'>State</div>"
-                f"<span class='chip {chip_cls}'>{run.state}</span>",
-                unsafe_allow_html=True)
-            h4.markdown(
-                f"<div style='font-size:.72rem;color:#6b7280'>Legs</div>"
-                f"<div style='font-weight:600'>{len(run.legs)}</div>",
-                unsafe_allow_html=True)
-            if h5.button("✕", key=f"del_{run.id}"):
-                bot.remove_run(run.id); st.rerun()
+        st.markdown(
+            f"""
+            <div class='sig-card {css}'>
+              <div style='display:flex;justify-content:space-between;
+                          align-items:flex-start;gap:12px'>
+                <div>
+                  <span style='font-size:1.2rem;font-weight:800'>
+                    {emoji} {o['direction']}
+                    &nbsp;&mdash;&nbsp;
+                    <span style='font-family:monospace'>{o['symbol']}</span>
+                    &nbsp;{o['strike']:,} {o['opt_type']}
+                  </span>
+                  <div style='color:#475569;font-size:.84rem;margin-top:5px'>
+                    {o['reason']}
+                  </div>
+                </div>
+                <span class='tag {t_css}'>{o['color']}</span>
+              </div>
+              <div class='stat-row'>
+                <div class='stat-col'>
+                  <span class='stat-lbl'>Index Spot</span>
+                  <span class='stat-val'>₹{o['spot']:,.0f}</span>
+                </div>
+                <div class='stat-col'>
+                  <span class='stat-lbl'>Suggested Strike</span>
+                  <span class='stat-val'>{o['strike']:,} {o['opt_type']}</span>
+                </div>
+                <div class='stat-col'>
+                  <span class='stat-lbl'>PCR</span>
+                  <span class='stat-val'>{o['pcr']:.2f}</span>
+                </div>
+                <div class='stat-col'>
+                  <span class='stat-lbl'>Max Pain</span>
+                  <span class='stat-val'>{o['max_pain']:,}</span>
+                </div>
+                <div class='stat-col'>
+                  <span class='stat-lbl'>ATM Strike</span>
+                  <span class='stat-val'>{o['atm']:,}</span>
+                </div>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-            # Legs table
-            if run.legs:
-                rows = []
-                for leg in run.legs:
-                    cur    = feed.spot(leg["sym"]) or leg["entry_px"]
-                    closed = leg.get("exit_px") is not None
-                    leg_pnl = leg.get("pnl") if closed else (
-                        (leg["entry_px"] - cur) * leg["qty"] if leg["side"] == "SELL"
-                        else (cur - leg["entry_px"]) * leg["qty"]
-                    )
-                    rows.append({
-                        "Symbol":  leg["sym"],
-                        "Side":    leg["side"],
-                        "Qty":     leg["qty"],
-                        "Entry ₹": f"₹{leg['entry_px']:.2f}",
-                        "LTP ₹":   f"₹{leg.get('exit_px', cur):.2f}",
-                        "P&L":     f"₹{leg_pnl:+,.0f}",
-                        "Status":  "Closed" if closed else "Open",
-                    })
-                st.dataframe(pd.DataFrame(rows), use_container_width=True,
-                             hide_index=True, height=min(200, 56 + 38 * len(rows)))
 
-            # Log
-            if run.log:
-                with st.expander(f"📋 Log ({len(run.log)})", expanded=run.state == "ACTIVE"):
-                    st.code("\n".join(f"[{e['ts']}] {e['msg']}"
-                                     for e in reversed(run.log[-40:])), language="")
+# ── Scan footer ────────────────────────────────────────────────────────────────
+st.divider()
+fc1, fc2 = st.columns([5, 1])
 
-# ── Completed P&L chart ────────────────────────────────────────────────────────
-done = [r for r in runs if r.state == "DONE"]
-if done:
-    st.divider()
-    st.subheader("📈 Completed Runs")
-    labels = [f"{r.name[:6]}\n{r.symbol} {r.id}" for r in done]
-    vals   = [r.pnl for r in done]
-    fig    = go.Figure(go.Bar(
-        x=labels, y=vals,
-        marker_color=["#1a7f3c" if v >= 0 else "#dc2626" for v in vals],
-        text=[f"₹{v:+,.0f}" for v in vals], textposition="outside",
-    ))
-    fig.update_layout(height=260, margin=dict(l=8, r=8, t=16, b=8),
-                      yaxis_title="P&L (₹)", plot_bgcolor="#fff",
-                      paper_bgcolor="#fff", font=dict(color="#374151"),
-                      xaxis=dict(gridcolor="#e5e7eb"),
-                      yaxis=dict(gridcolor="#e5e7eb"))
-    fig.add_hline(y=0, line_color="#9ca3af", line_width=1)
-    st.plotly_chart(fig, use_container_width=True)
+last     = screener.last_scan
+n_stocks = len(screener.get_results())
 
-# ── Auto-refresh ───────────────────────────────────────────────────────────────
-if bot.is_running:
-    st.caption(f"🔄 Refreshing every 5s · {datetime.now().strftime('%H:%M:%S')}")
-    time.sleep(5)
+if last:
+    fc1.caption(
+        f"Last scan: **{last.strftime('%d %b %Y %H:%M:%S')}** · "
+        f"{n_stocks} stocks analysed · next auto-scan in ~15 min"
+    )
+else:
+    fc1.caption("No scan run yet.")
+
+if fc2.button("🔄 Scan Now", use_container_width=True):
+    with st.spinner("Scanning stocks ..."):
+        screener.scan()
     st.rerun()
-else:
-    st.button("🔄 Refresh", key="manual_refresh", on_click=st.rerun)
+
+
+# ── Auto-refresh every 30 s ────────────────────────────────────────────────────
+# Page is fully rendered above; browser shows all content.
+# The 30-second sleep keeps the session alive and then reruns the script.
+time.sleep(30)
+st.rerun()
