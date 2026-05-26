@@ -11,8 +11,7 @@ from plotly.subplots import make_subplots
 import streamlit as st
 
 from broker.groww import connector
-from data import feed
-from engine.bot import bot
+from data import db, feed
 from engine.indicators import (
     bollinger_bands, ema as _ema, macd as _macd, rsi as _rsi,
     atr as _atr, adx as _adx, volume_ratio as _vol_ratio,
@@ -21,6 +20,35 @@ from engine.risk_guard import risk_guard
 from engine.screener import NIFTY50, NIFTY_NEXT50, FNO_EXTRAS, screener
 
 st.set_page_config(page_title="Live Charts", page_icon="📈", layout="wide")
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_chart_data(symbol: str, period: str, interval: str):
+    """Cache OHLCV data for 5 minutes to avoid yfinance rate limits."""
+    import logging
+    import yfinance as yf
+    yf_sym = {"NIFTY": "^NSEI", "BANKNIFTY": "^NSEBANK", "VIX": "^INDIAVIX"}.get(
+        symbol.upper(), symbol.upper() + ".NS"
+    )
+    logger = logging.getLogger("yfinance")
+    prev_level = logger.level
+    logger.setLevel(logging.CRITICAL)
+    try:
+        df = yf.Ticker(yf_sym).history(period=period, interval=interval)
+        if df.empty:
+            return None, "No data returned — market may be closed or holiday."
+        df.index = df.index.tz_localize(None) if df.index.tzinfo else df.index
+        return df[["Open", "High", "Low", "Close", "Volume"]].copy(), None
+    except Exception as e:
+        err = str(e)
+        if "Rate" in err or "429" in err or "Too Many" in err:
+            return None, (
+                "**Yahoo Finance rate limit hit.** The screener made too many requests. "
+                "Wait 30–60 seconds then click 🔄 Refresh."
+            )
+        return None, f"Could not load data: {err}"
+    finally:
+        logger.setLevel(prev_level)
 
 # ── CSS ─────────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -67,6 +95,8 @@ with col_int:
 with col_ref:
     st.write("")
     refresh_btn = st.button("🔄", help="Refresh", use_container_width=True)
+    if refresh_btn:
+        _load_chart_data.clear()
 
 # ── Overlays ────────────────────────────────────────────────────────────────────
 ov1, ov2, ov3, ov4, ov5 = st.columns(5)
@@ -78,13 +108,14 @@ show_macd  = ov5.toggle("MACD",   value=False, key="ov_macd")
 
 st.divider()
 
-# ── Fetch data ───────────────────────────────────────────────────────────────────
-with st.spinner(f"Loading {symbol}…"):
-    df = feed.ohlcv(symbol, period=period, interval=interval)
-    q  = feed.refresh(symbol)   # live price
+# ── Fetch data (cached 5 min to avoid rate limits) ───────────────────────────────
+with st.spinner(f"Loading {symbol} …"):
+    df, _err = _load_chart_data(symbol, period, interval)
+    q        = feed.get_price(symbol) or {}
 
-if df is None or df.empty:
-    st.error(f"Could not load data for **{symbol}**. Check symbol or try a different period/interval.")
+if df is None:
+    st.error(_err or f"Could not load data for **{symbol}**.")
+    st.caption("Tip: click 🔄 Refresh above, or switch to a longer period like **3mo / 1d**.")
     st.stop()
 
 closes  = list(df["Close"])
@@ -294,85 +325,73 @@ with sc_col:
         st.info(f"**Best fit:** {sig} strategy · {pct_52h:+.1f}% from 52-week high")
 
 with tr_col:
-    st.markdown("#### 🚀 Trade Setup")
-    atr_val   = price * atr14 / 100
-    open_cnt  = sum(1 for r in bot.get_runs() if r.state in ("WAITING", "ACTIVE"))
-    live_mode = connector.is_connected
+    st.markdown("#### � Place Order")
+    atr_val  = price * atr14 / 100
+    is_live  = connector.is_connected
+    sl_px    = round(risk_guard.sl_price(price, atr_val, "BUY", vix), 2)
+    tgt_px   = round(risk_guard.target_price(price, atr_val, "BUY", vix), 2)
+    risk_amt = round(price - sl_px, 2)
+    rwd_amt  = round(tgt_px - price, 2)
+    rr_val   = round(rwd_amt / risk_amt, 1) if risk_amt > 0 else 0
+    def_qty  = max(1, risk_guard.position_size(price, atr_val, vix, 0))
 
-    t1, t2 = st.columns(2)
+    if is_live:
+        st.success("🟢 Connected to Groww — orders will be REAL")
+    else:
+        st.info("🔵 Not connected — orders will be paper trades")
 
-    # ── Intraday setup ─────────────────────────────────────────────────────────
-    with t1:
-        st.markdown("**⚡ Intraday (MIS)**")
-        intr_mode = st.selectbox("Mode", ["Momentum", "VWAP", "ORB"], key="ct_imode")
-        intr_qty  = st.number_input(
-            "Qty", 1, 50000,
-            max(1, risk_guard.position_size(price, atr_val, vix, open_cnt)),
-            key="ct_iqty",
-            help="Auto-sized by ATR risk"
+    st.markdown(
+        f"<div style='background:#f9fafb;border:1px solid #e5e7eb;border-radius:10px;"
+        f"padding:12px 16px;margin-bottom:12px'>"
+        f"<div style='display:flex;gap:24px;flex-wrap:wrap'>"
+        f"<div><div style='font-size:.7rem;color:#64748b;font-weight:600'>Entry</div>"
+        f"<div style='font-size:1rem;font-weight:800'>₹{price:,.2f}</div></div>"
+        f"<div><div style='font-size:.7rem;color:#e11d48;font-weight:600'>Stop-Loss</div>"
+        f"<div style='font-size:1rem;font-weight:800;color:#e11d48'>₹{sl_px:,.2f}</div></div>"
+        f"<div><div style='font-size:.7rem;color:#16a34a;font-weight:600'>Target</div>"
+        f"<div style='font-size:1rem;font-weight:800;color:#16a34a'>₹{tgt_px:,.2f}</div></div>"
+        f"<div><div style='font-size:.7rem;color:#64748b;font-weight:600'>R:R</div>"
+        f"<div style='font-size:1rem;font-weight:800'>1 : {rr_val}</div></div>"
+        f"</div></div>",
+        unsafe_allow_html=True,
+    )
+
+    with st.popover(f"🛒 Place Order — {symbol}", use_container_width=True):
+        st.markdown(f"**BUY {symbol}** · Entry ~₹{price:,.2f}")
+        ct_qty  = st.number_input("Quantity", min_value=1, value=def_qty,
+                                   step=1, key="ct_qty")
+        ct_prod = st.radio(
+            "Order type",
+            ["Intraday (MIS) — exit by 3:20 PM", "Delivery (CNC) — hold overnight"],
+            key="ct_prod",
         )
-        intr_sl   = st.number_input("SL %", 0.1, 5.0,
-                                     round(risk_guard.sl_pct(price, atr_val, vix), 2),
-                                     step=0.1, key="ct_isl")
-        intr_tgt  = st.number_input("Target %", 0.1, 10.0,
-                                     round(risk_guard.target_pct(price, atr_val, vix), 2),
-                                     step=0.1, key="ct_itgt")
-        intr_paper = not live_mode or st.toggle("Paper mode", True, key="ct_ipaper")
-
-        # Risk summary
-        max_loss = round(price * intr_sl / 100 * intr_qty, 0)
-        max_gain = round(price * intr_tgt / 100 * intr_qty, 0)
-        rr       = round(intr_tgt / intr_sl, 2) if intr_sl > 0 else 0
-        st.markdown(
-            f"<div style='font-size:.8rem;color:#6b7280'>"
-            f"Max loss ₹{max_loss:,.0f} · Max gain ₹{max_gain:,.0f} · R:R {rr:.1f}:1</div>",
-            unsafe_allow_html=True,
+        max_loss_show = round((price - sl_px) * ct_qty, 0)
+        max_gain_show = round((tgt_px - price) * ct_qty, 0)
+        st.caption(
+            f"Max loss ₹{max_loss_show:,.0f} · Max gain ₹{max_gain_show:,.0f}"
         )
-        if st.button("⚡ Add Intraday run", type="primary",
-                     use_container_width=True, key="ct_iadd"):
-            sid = bot.add_run("Intraday", symbol=symbol, paper=intr_paper, params={
-                "symbol": symbol, "mode": intr_mode,
-                "qty": intr_qty, "entry_time": "09:20", "exit_time": "15:10",
-                "target_pct": intr_tgt, "sl_pct": intr_sl,
-                "fast_ema": 9, "slow_ema": 21,
-            })
-            if not bot.is_running: bot.start()
-            st.success(f"✅ Intraday run `{sid}` added for {symbol}")
+        if st.button("✅ Confirm Order", key="ct_confirm",
+                     type="primary", use_container_width=True):
+            prod_code = "MIS" if "Intraday" in ct_prod else "CNC"
+            result = connector.market_order(
+                symbol, "BUY", int(ct_qty), "CASH", prod_code
+            )
+            if result["status"] == "SUCCESS":
+                db.open_trade(
+                    run_id=0, strategy="CHART",
+                    symbol=symbol, side="BUY",
+                    qty=int(ct_qty), entry_px=price,
+                    paper=result["mock"],
+                )
+                if result["mock"]:
+                    st.success(
+                        f"📝 Paper trade: BUY {ct_qty}× {symbol} @ ₹{price:,.2f}"
+                    )
+                else:
+                    st.success(
+                        f"✅ Order placed on Groww! ID: {result['order_id']}"
+                    )
+            else:
+                st.error(f"❌ Failed: {result.get('error', 'Unknown')}")
 
-    # ── MTF setup ──────────────────────────────────────────────────────────────
-    with t2:
-        st.markdown("**💳 MTF (Swing)**")
-        mtf_sig  = st.selectbox("Signal", ["EMA Cross", "RSI Bounce"], key="ct_msig")
-        mtf_qty  = st.number_input(
-            "Qty", 1, 50000,
-            max(1, risk_guard.position_size(price, atr_val, vix, open_cnt)),
-            key="ct_mqty",
-            help="Auto-sized by ATR risk"
-        )
-        mtf_sl   = st.number_input("SL %", 0.1, 10.0,
-                                    round(risk_guard.sl_pct(price, atr_val, vix), 2),
-                                    step=0.1, key="ct_msl")
-        mtf_tgt  = st.number_input("Target %", 0.1, 20.0,
-                                    round(risk_guard.target_pct(price, atr_val, vix), 2),
-                                    step=0.1, key="ct_mtgt")
-        mtf_days = st.number_input("Max days", 1, 30, 3, key="ct_mdays")
-        mtf_paper = not live_mode or st.toggle("Paper mode", True, key="ct_mpaper")
-
-        max_loss_m = round(price * mtf_sl / 100 * mtf_qty, 0)
-        max_gain_m = round(price * mtf_tgt / 100 * mtf_qty, 0)
-        rr_m       = round(mtf_tgt / mtf_sl, 2) if mtf_sl > 0 else 0
-        st.markdown(
-            f"<div style='font-size:.8rem;color:#6b7280'>"
-            f"Max loss ₹{max_loss_m:,.0f} · Max gain ₹{max_gain_m:,.0f} · R:R {rr_m:.1f}:1</div>",
-            unsafe_allow_html=True,
-        )
-        if st.button("💳 Add MTF run", type="primary",
-                     use_container_width=True, key="ct_madd"):
-            sid = bot.add_run("MTF", symbol=symbol, paper=mtf_paper, params={
-                "symbol": symbol, "signal": mtf_sig,
-                "fast_ema": 9, "slow_ema": 21, "rsi_level": 35,
-                "qty": mtf_qty, "target_pct": mtf_tgt,
-                "sl_pct": mtf_sl, "max_days": mtf_days,
-            })
-            if not bot.is_running: bot.start()
-            st.success(f"✅ MTF run `{sid}` added for {symbol}")
+    st.caption("SL and Target are ATR-based and adjust to current volatility.")
