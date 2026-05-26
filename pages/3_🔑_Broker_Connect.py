@@ -21,8 +21,8 @@ if connector.is_connected:
     col1.metric("Available margin", f"₹{m.get('available', 0):,.0f}")
     col2.metric("Equity",           f"₹{m.get('equity', 0):,.0f}")
     col3.metric("F&O margin",       f"₹{m.get('fno', 0):,.0f}")
-    if st.button("🔌 Disconnect"):
-        connector._client = None
+    if st.button("🔌 Disconnect", type="secondary"):
+        connector.disconnect()
         st.rerun()
     st.stop()
 
@@ -40,14 +40,14 @@ if method == "Access Token":
             if not token.strip():
                 st.error("Token is required.")
             else:
-                res = connector.auth_token(token.strip())
-                if res:
+                ok, msg = connector.auth_token(token.strip())
+                if ok:
                     if save:
                         set_key(ENV_FILE, "GROWW_ACCESS_TOKEN", token.strip())
                     st.success("✅ Connected via access token!")
                     st.rerun()
                 else:
-                    st.error("❌ Connection failed — check your token.")
+                    st.error(f"❌ Connection failed — {msg}")
 
 else:  # TOTP
     with st.form("bc_totp"):
@@ -59,15 +59,15 @@ else:  # TOTP
             if not api_key.strip() or not totp_secret.strip():
                 st.error("Both API Key and TOTP Secret are required.")
             else:
-                res = connector.auth_totp(api_key.strip(), totp_secret.strip())
-                if res:
+                ok, msg = connector.auth_totp(api_key.strip(), totp_secret.strip())
+                if ok:
                     if save:
                         set_key(ENV_FILE, "GROWW_API_KEY",      api_key.strip())
                         set_key(ENV_FILE, "GROWW_TOTP_SECRET",  totp_secret.strip())
                     st.success("✅ Connected via TOTP!")
                     st.rerun()
                 else:
-                    st.error("❌ Connection failed — check credentials.")
+                    st.error(f"❌ Connection failed — {msg}")
 
 st.divider()
 st.caption("""
