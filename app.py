@@ -13,7 +13,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from broker.groww import connector
-from data import feed
+from data import db, feed
 from engine.screener import screener
 
 st.set_page_config(
@@ -227,7 +227,7 @@ if not sigs:
         "Click **Scan Now** below or wait for the auto-scan."
     )
 else:
-    for s in sigs:
+    for i, s in enumerate(sigs):
         is_new  = f"{s['symbol']}_{s['direction']}" in new_keys
         is_buy  = s["direction"] == "BUY"
         css     = "sig-buy" if is_buy else "sig-sell"
@@ -284,6 +284,52 @@ else:
             unsafe_allow_html=True,
         )
 
+        # ── Place order button for this signal ────────────────────────────
+        btn_col, _ = st.columns([1, 5])
+        with btn_col:
+            with st.popover(f"🛒 Place Order — {s['symbol']}", use_container_width=True):
+                is_live = connector.is_connected
+                st.markdown(f"**{s['direction']} {s['symbol']}** · Entry ~₹{s['price']:,.2f}")
+                st.caption(f"SL ₹{s['sl']:,.2f}  ·  Target ₹{s['target']:,.2f}  ·  R:R 1:{s['risk_reward']}")
+                if is_live:
+                    st.success("🟢 Connected — will place a REAL order on Groww")
+                else:
+                    st.info("🔵 Not connected — will be logged as a paper trade")
+                qty = st.number_input(
+                    "Quantity (shares)", min_value=1, value=1, step=1,
+                    key=f"sq_{i}",
+                )
+                product = st.radio(
+                    "Order type",
+                    ["Intraday (MIS) — exit by 3:20 PM", "Delivery (CNC) — hold overnight"],
+                    key=f"sp_{i}",
+                )
+                if st.button("✅ Confirm Order", key=f"sc_{i}", type="primary",
+                             use_container_width=True):
+                    prod_code = "MIS" if "Intraday" in product else "CNC"
+                    result = connector.market_order(
+                        s["symbol"], s["direction"], int(qty), "CASH", prod_code
+                    )
+                    if result["status"] == "SUCCESS":
+                        db.open_trade(
+                            run_id=0, strategy="SIGNAL",
+                            symbol=s["symbol"], side=s["direction"],
+                            qty=int(qty), entry_px=s["price"],
+                            paper=result["mock"],
+                        )
+                        if result["mock"]:
+                            st.success(
+                                f"📝 Paper trade logged: {s['direction']} "
+                                f"{qty}× {s['symbol']} @ ₹{s['price']:,.2f}"
+                            )
+                        else:
+                            st.success(
+                                f"✅ Order placed on Groww!  "
+                                f"ID: {result['order_id']}"
+                            )
+                    else:
+                        st.error(f"❌ Order failed: {result.get('error', 'Unknown')}")
+
 
 # ── Options signals ────────────────────────────────────────────────────────────
 st.divider()
@@ -295,7 +341,7 @@ if not opt_sigs:
         "NSE's API is typically accessible during market hours (9:15 AM – 3:30 PM IST)."
     )
 else:
-    for o in opt_sigs:
+    for j, o in enumerate(opt_sigs):
         is_buy = o["color"] == "BUY"
         is_neu = o["color"] == "NEUTRAL"
         css    = "sig-buy" if is_buy else ("sig-sell" if not is_neu else "sig-neu")
@@ -346,6 +392,59 @@ else:
             """,
             unsafe_allow_html=True,
         )
+
+        # ── Place order button for this options signal ─────────────────────
+        opt_btn_col, _ = st.columns([1, 5])
+        with opt_btn_col:
+            opt_label = f"BUY CE" if o["color"] == "BUY" else (
+                        f"BUY PE" if o["color"] == "SELL" else "Straddle")
+            with st.popover(
+                f"🛒 {opt_label} — {o['symbol']} {o['strike']:,} {o['opt_type']}",
+                use_container_width=True,
+            ):
+                is_live = connector.is_connected
+                st.markdown(
+                    f"**{o['direction']}** · "
+                    f"{o['symbol']} {o['strike']:,} {o['opt_type']}"
+                )
+                st.caption(
+                    f"Spot: ₹{o['spot']:,.0f}  ·  ATM: {o['atm']:,}  ·  PCR: {o['pcr']:.2f}"
+                )
+                st.warning(
+                    "⚠️ Options premiums change every second. "
+                    "Verify the current LTP on Groww before confirming."
+                )
+                if is_live:
+                    st.success("🟢 Connected — will place a REAL order")
+                else:
+                    st.info("🔵 Not connected — paper trade only")
+                lots = st.number_input(
+                    "Lots", min_value=1, value=1, step=1,
+                    help="1 lot = 75 for NIFTY · 30 for BANKNIFTY",
+                    key=f"oq_{j}",
+                )
+                lot_size = 75 if o["symbol"] == "NIFTY" else 30
+                qty_shares = int(lots) * lot_size
+                st.caption(f"= {qty_shares} shares total")
+                fno_sym = f"{o['symbol']}{o['strike']}{o['opt_type']}"
+                if st.button("✅ Confirm Options Order", key=f"oc_{j}",
+                             type="primary", use_container_width=True):
+                    result = connector.market_order(
+                        fno_sym, "BUY", qty_shares, "FNO", "NRML"
+                    )
+                    if result["status"] == "SUCCESS":
+                        db.open_trade(
+                            run_id=0, strategy="OPTIONS_SIGNAL",
+                            symbol=fno_sym, side="BUY",
+                            qty=qty_shares, entry_px=0.0,
+                            paper=result["mock"],
+                        )
+                        if result["mock"]:
+                            st.success(f"📝 Paper trade logged: {fno_sym} × {qty_shares}")
+                        else:
+                            st.success(f"✅ Options order placed! ID: {result['order_id']}")
+                    else:
+                        st.error(f"❌ Order failed: {result.get('error', 'Unknown')}")
 
 
 # ── Scan footer ────────────────────────────────────────────────────────────────
